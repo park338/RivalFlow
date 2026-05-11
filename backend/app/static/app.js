@@ -16,16 +16,21 @@ const claimsEl = document.getElementById("claims");
 const scorecardWrapEl = document.getElementById("scorecardWrap");
 const claimsWrapEl = document.getElementById("claimsWrap");
 
+const FOCUS_AREA_OPTIONS = ["产品定位", "用户体验", "商业化能力", "增长策略", "技术能力"];
+
 let pollingTimer = null;
 let selectedNodeKey = null;
 let latestTask = null;
+let selectedFocusAreas = new Set(["产品定位", "用户体验", "商业化能力", "增长策略"]);
+
+renderFocusAreaTags();
 
 demoBtn.addEventListener("click", () => {
   document.getElementById("projectName").value = "2026 短视频电商商业化策略对比（抖音 vs 快手 vs 小红书）";
   document.getElementById("industry").value = "内容电商";
   document.getElementById("competitors").value = "抖音,快手,小红书";
   document.getElementById("sourceUrls").value = "https://www.douyin.com,https://www.kuaishou.com,https://www.xiaohongshu.com";
-  setSelectValues("focusAreas", ["产品定位", "用户体验", "商业化能力", "增长策略"]);
+  setFocusAreas(["产品定位", "用户体验", "商业化能力", "增长策略"]);
   document.getElementById("timeRange").value = "近 12 个月";
 });
 
@@ -70,7 +75,7 @@ function buildPayload() {
       .map((item) => item.trim())
       .filter(Boolean);
 
-  const focusAreas = Array.from(document.getElementById("focusAreas").selectedOptions).map((item) => item.value);
+  const focusAreas = Array.from(selectedFocusAreas);
   return {
     project_name: document.getElementById("projectName").value.trim() || "RivalFlow 竞品分析 Demo",
     industry: document.getElementById("industry").value.trim(),
@@ -345,15 +350,71 @@ function formatTime(isoTime) {
 
 function getContextText(context) {
   if (!context || !Object.keys(context).length) return "";
-  return JSON.stringify(context, null, 2);
+  return formatContextValue(context);
 }
 
-function setSelectValues(selectId, values) {
-  const selected = new Set(values);
-  const select = document.getElementById(selectId);
-  Array.from(select.options).forEach((option) => {
-    option.selected = selected.has(option.value);
+function renderFocusAreaTags() {
+  const wrap = document.getElementById("focusAreas");
+  wrap.innerHTML = "";
+  FOCUS_AREA_OPTIONS.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "tag-pill";
+    button.textContent = item;
+    if (selectedFocusAreas.has(item)) {
+      button.classList.add("active");
+    }
+    button.setAttribute("aria-pressed", String(selectedFocusAreas.has(item)));
+    button.addEventListener("click", () => {
+      if (selectedFocusAreas.has(item)) {
+        selectedFocusAreas.delete(item);
+      } else {
+        selectedFocusAreas.add(item);
+      }
+      if (!selectedFocusAreas.size) {
+        selectedFocusAreas.add(item);
+      }
+      renderFocusAreaTags();
+    });
+    wrap.appendChild(button);
   });
+}
+
+function setFocusAreas(values) {
+  const mapped = values.filter((item) => FOCUS_AREA_OPTIONS.includes(item));
+  selectedFocusAreas = new Set(mapped.length ? mapped : [FOCUS_AREA_OPTIONS[0]]);
+  renderFocusAreaTags();
+}
+
+function formatContextValue(value, depth = 0) {
+  const indent = "  ".repeat(depth);
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) {
+    if (!value.length) return "[]";
+    return value
+      .map((item) => {
+        const inner = formatContextValue(item, depth + 1);
+        return `${indent}- ${inner.replaceAll("\n", `\n${indent}  `)}`;
+      })
+      .join("\n");
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value);
+    if (!entries.length) return "{}";
+    return entries
+      .map(([key, item]) => {
+        const inner = formatContextValue(item, depth + 1);
+        if (inner.includes("\n")) {
+          return `${indent}${key}:\n${inner}`;
+        }
+        return `${indent}${key}: ${inner}`;
+      })
+      .join("\n");
+  }
+  if (typeof value === "string") {
+    return value.replaceAll("\\n", "\n").replaceAll("\r\n", "\n");
+  }
+  return String(value);
 }
 
 function escapeHtml(value) {

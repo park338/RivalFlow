@@ -417,6 +417,7 @@ class PipelineRunner:
         context: dict[str, Any] | None = None,
     ) -> None:
         now = datetime.utcnow()
+        safe_context = self._sanitize_context(context or {})
 
         def mutate(task: TaskDetail) -> None:
             for node in task.nodes:
@@ -424,7 +425,7 @@ class PipelineRunner:
                     node.status = "running"
                     node.summary = summary
                     node.started_at = node.started_at or now
-                    node.context.update(context or {})
+                    node.context.update(safe_context)
                     break
 
         await self.store.mutate_task(task_id, mutate)
@@ -434,7 +435,7 @@ class PipelineRunner:
             summary,
             node_key=node_key,
             stage="node_start",
-            context=context or {},
+            context=safe_context,
         )
 
     async def _finish_node(
@@ -447,6 +448,7 @@ class PipelineRunner:
     ) -> None:
         now = datetime.utcnow()
         duration_ms = 0
+        safe_context = self._sanitize_context(context or {})
 
         def mutate(task: TaskDetail) -> None:
             nonlocal duration_ms
@@ -457,12 +459,12 @@ class PipelineRunner:
                     node.finished_at = now
                     if node.started_at:
                         duration_ms = int((now - node.started_at).total_seconds() * 1000)
-                    node.context.update(context or {})
+                    node.context.update(safe_context)
                     node.context["duration_ms"] = duration_ms
                     break
 
         await self.store.mutate_task(task_id, mutate)
-        event_context = dict(context or {})
+        event_context = dict(safe_context)
         event_context["duration_ms"] = duration_ms
         await self._append_event(
             task_id,
@@ -483,6 +485,8 @@ class PipelineRunner:
         stage: str = "progress",
         context: dict[str, Any] | None = None,
     ) -> None:
+        safe_context = self._sanitize_context(context or {})
+
         def mutate(task: TaskDetail) -> None:
             task.events.append(
                 TaskEvent(
@@ -491,7 +495,7 @@ class PipelineRunner:
                     message=message,
                     node_key=node_key,
                     stage=stage,
-                    context=context or {},
+                    context=safe_context,
                 )
             )
 
@@ -510,7 +514,7 @@ class PipelineRunner:
                 "prompt_tokens": trace.prompt_tokens,
                 "completion_tokens": trace.completion_tokens,
                 "total_tokens": trace.total_tokens,
-                "content_preview": trace.content_preview,
+                "content_preview": self._normalize_preview_text(trace.content_preview),
             },
         )
 
@@ -546,6 +550,47 @@ class PipelineRunner:
             if item in text:
                 return item
         return competitors[0] if competitors else ""
+
+    @classmethod
+    def _sanitize_context(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key): cls._sanitize_context(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._sanitize_context(item) for item in value]
+        if isinstance(value, tuple):
+            return [cls._sanitize_context(item) for item in value]
+        if isinstance(value, str):
+            text = value.replace("\r\n", "\n").replace("\r", "\n")
+            text = text.replace("\\n", "\n").replace("\\t", "    ")
+            return text
+        return value
+
+    @classmethod
+    def _normalize_preview_text(cls, text: str) -> str:
+        sanitized = cls._sanitize_context(text)
+        preview = str(sanitized)[:1200]
+        stripped = preview.strip()
+        parsed = cls._try_parse_json(stripped)
+        if parsed is not None:
+            return json.dumps(parsed, ensure_ascii=False, indent=2)
+        return preview
+
+    @staticmethod
+    def _try_parse_json(text: str) -> dict[str, Any] | list[Any] | None:
+        candidate = text.strip()
+        if not candidate:
+            return None
+        if candidate.startswith("```"):
+            candidate = candidate.strip("`")
+            if candidate.startswith("json"):
+                candidate = candidate[4:].strip()
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, (dict, list)):
+            return parsed
+        return None
 
     def _build_analyst_prompt(
         self,
