@@ -105,8 +105,11 @@
       </section>
 
       <section class="panel">
-        <h2>最终报告</h2>
-        <pre id="report" class="report">任务完成后展示。</pre>
+        <div class="report-head">
+          <h2>最终报告</h2>
+          <button id="exportPdfBtn" type="button" class="ghost export-btn">结果导出</button>
+        </div>
+        <div id="report" class="report markdown-report">任务完成后展示。</div>
       </section>
     </main>
     <script src="/static/app.js"></script>

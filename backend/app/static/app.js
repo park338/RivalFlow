@@ -11,6 +11,7 @@ const nodeDetailContextEl = document.getElementById("nodeDetailContext");
 const nodeEventsEl = document.getElementById("nodeEvents");
 const evidenceBodyEl = document.querySelector("#evidenceTable tbody");
 const reportEl = document.getElementById("report");
+const exportPdfBtn = document.getElementById("exportPdfBtn");
 const scorecardEl = document.getElementById("scorecard");
 const claimsEl = document.getElementById("claims");
 const scorecardWrapEl = document.getElementById("scorecardWrap");
@@ -24,6 +25,7 @@ let latestTask = null;
 let selectedFocusAreas = new Set(["产品定位", "用户体验", "商业化能力", "增长策略"]);
 
 renderFocusAreaTags();
+exportPdfBtn.addEventListener("click", exportReportPdf);
 
 demoBtn.addEventListener("click", () => {
   document.getElementById("projectName").value = "2026 短视频电商商业化策略对比（抖音 vs 快手 vs 小红书）";
@@ -143,7 +145,7 @@ function renderTask(task) {
   renderEvidence(task.evidence || []);
   renderScorecard(task.result?.scorecard || {});
   renderClaims(task.result?.claims || []);
-  reportEl.textContent = task.result?.markdown_report || "任务完成后展示。";
+  renderReport(task.result?.markdown_report || "");
 }
 
 function renderTimeline(nodes) {
@@ -228,7 +230,7 @@ function renderNodeDetail(task, nodeKey) {
 
   const nodeEvents = (task.events || [])
     .filter((event) => event.node_key === nodeKey)
-    .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+    .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
 
   nodeEventsEl.innerHTML = "";
   if (!nodeEvents.length) {
@@ -319,7 +321,7 @@ function renderClaims(claims) {
     const evidenceText = (claim.evidence_ids || []).join(", ");
     const li = document.createElement("li");
     li.className = "claim-item";
-    li.textContent = `${claim.title}：${claim.detail}（置信度 ${Number(claim.confidence).toFixed(2)}，证据ID: ${evidenceText}）`;
+    li.textContent = `[${claim.claim_id}] ${claim.title}：${claim.detail}（置信度 ${Number(claim.confidence).toFixed(2)}，证据ID: ${evidenceText}）`;
     claimsEl.appendChild(li);
   });
   claimsWrapEl.classList.remove("hidden");
@@ -415,6 +417,138 @@ function formatContextValue(value, depth = 0) {
     return value.replaceAll("\\n", "\n").replaceAll("\r\n", "\n");
   }
   return String(value);
+}
+
+function renderReport(markdownText) {
+  if (!markdownText || !markdownText.trim()) {
+    reportEl.textContent = "任务完成后展示。";
+    return;
+  }
+  reportEl.innerHTML = markdownToHtml(markdownText);
+}
+
+function markdownToHtml(markdownText) {
+  const lines = markdownText.replaceAll("\r\n", "\n").split("\n");
+  const html = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const rawLine = lines[index];
+    const line = rawLine.trim();
+
+    if (!line) {
+      index += 1;
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      const level = heading[1].length;
+      html.push(`<h${level}>${applyInlineMarkdown(heading[2])}</h${level}>`);
+      index += 1;
+      continue;
+    }
+
+    if (line.includes("|") && index + 1 < lines.length && /^\|?[\s:-|]+\|?$/.test(lines[index + 1].trim())) {
+      const headerCells = parseTableRow(line);
+      index += 2;
+      const rows = [];
+      while (index < lines.length && lines[index].includes("|")) {
+        rows.push(parseTableRow(lines[index]));
+        index += 1;
+      }
+      html.push(buildTableHtml(headerCells, rows));
+      continue;
+    }
+
+    if (line.startsWith("- ")) {
+      const items = [];
+      while (index < lines.length && lines[index].trim().startsWith("- ")) {
+        items.push(lines[index].trim().slice(2));
+        index += 1;
+      }
+      html.push(
+        `<ul>${items.map((item) => `<li>${applyInlineMarkdown(item)}</li>`).join("")}</ul>`
+      );
+      continue;
+    }
+
+    html.push(`<p>${applyInlineMarkdown(line)}</p>`);
+    index += 1;
+  }
+
+  return html.join("");
+}
+
+function parseTableRow(line) {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function buildTableHtml(headers, rows) {
+  const thead = `<thead><tr>${headers.map((cell) => `<th>${applyInlineMarkdown(cell)}</th>`).join("")}</tr></thead>`;
+  const tbodyRows = rows
+    .map(
+      (row) =>
+        `<tr>${headers.map((_, idx) => `<td>${applyInlineMarkdown(row[idx] || "")}</td>`).join("")}</tr>`
+    )
+    .join("");
+  return `<table class="report-table">${thead}<tbody>${tbodyRows}</tbody></table>`;
+}
+
+function applyInlineMarkdown(text) {
+  let html = escapeHtml(text);
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  return html;
+}
+
+function exportReportPdf() {
+  const reportMarkdown = latestTask?.result?.markdown_report || "";
+  if (!reportMarkdown.trim()) {
+    setMessage("当前没有可导出的报告。", true);
+    return;
+  }
+
+  const popup = window.open("", "_blank", "width=1080,height=900");
+  if (!popup) {
+    setMessage("无法打开导出窗口，请检查浏览器弹窗设置。", true);
+    return;
+  }
+
+  const title = latestTask?.input?.project_name || "RivalFlow Report";
+  const html = `
+    <!doctype html>
+    <html lang="zh-CN">
+      <head>
+        <meta charset="UTF-8" />
+        <title>${escapeHtml(title)}</title>
+        <style>
+          body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif; margin: 28px; color: #1f2937; }
+          h1,h2,h3,h4 { margin: 16px 0 10px; }
+          p { margin: 8px 0; line-height: 1.7; }
+          ul { margin: 8px 0 12px 18px; line-height: 1.7; }
+          table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+          th,td { border: 1px solid #d1d9e8; padding: 8px; text-align: left; font-size: 13px; }
+          th { background: #f5f7fb; }
+        </style>
+      </head>
+      <body>
+        ${markdownToHtml(reportMarkdown)}
+      </body>
+    </html>
+  `;
+
+  popup.document.open();
+  popup.document.write(html);
+  popup.document.close();
+  popup.focus();
+  setTimeout(() => {
+    popup.print();
+  }, 300);
 }
 
 function escapeHtml(value) {

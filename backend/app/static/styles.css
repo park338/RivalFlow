@@ -337,13 +337,61 @@ th {
   margin: 6px 0;
 }
 
+.report-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.export-btn {
+  min-height: 34px;
+  height: 34px;
+  padding: 0 12px;
+}
+
 .report {
   margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
   background: #f7f9ff;
   border: 1px solid #dbe4fa;
   border-radius: 6px;
   padding: 12px;
   font-size: 13px;
+  color: #1f2f49;
+}
+
+.markdown-report h1,
+.markdown-report h2,
+.markdown-report h3,
+.markdown-report h4 {
+  margin-top: 12px;
+  margin-bottom: 8px;
+}
+
+.markdown-report p {
+  margin: 8px 0;
+  line-height: 1.7;
+}
+
+.markdown-report ul {
+  margin: 8px 0 12px 18px;
+  line-height: 1.7;
+}
+
+.markdown-report .report-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+}
+
+.markdown-report .report-table th,
+.markdown-report .report-table td {
+  border: 1px solid #d1d9e8;
+  padding: 8px;
+  text-align: left;
+  font-size: 13px;
+}
+
+.markdown-report .report-table th {
+  background: #f5f7fb;
 }
