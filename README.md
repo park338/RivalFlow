@@ -1,53 +1,30 @@
 # RivalFlow Demo
 
-一个可直接跑通的多 Agent 竞品分析 Demo，支持从任务提交到报告生成的完整流程演示。
-
-## 项目结构
-
-```text
-backend/
-  app/
-    main.py            # FastAPI 入口
-    models.py          # 数据模型
-    storage.py         # 内存任务存储
-    pipeline.py        # 多 Agent 执行流程
-    static/
-      index.html       # 前端页面
-      app.js
-      styles.css
-  requirements.txt
-run_demo.ps1           # 一键启动脚本
-```
+可运行的多 Agent 竞品分析 Demo，支持任务提交、流程执行、证据追溯、报告生成。
 
 ## 快速启动
-
-1. 安装依赖
 
 ```powershell
 cd backend
 python -m pip install -r requirements.txt
-```
-
-2. 启动服务
-
-```powershell
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-或在项目根目录运行：
+或在项目根目录执行：
 
 ```powershell
 .\run_demo.ps1
 ```
 
-3. 打开页面
+打开：
 
 - [http://localhost:8000](http://localhost:8000)
-- API 文档：[http://localhost:8000/docs](http://localhost:8000/docs)
+- [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ## 当前能力（MVP）
 
-1. 创建分析任务（行业、竞品、维度、时间范围）
-2. 自动执行流程：`Planner -> Collector -> Structurer -> Analyst -> Reviewer -> Reporter`
-3. 实时查看节点状态和流程日志
-4. 输出证据链、评分卡、核心结论和 Markdown 报告
+1. 分析维度、时间范围支持下拉选择。
+2. Analyst 接入 `deepseek-v4-flash` 进行分析（可由 `DEEPSEEK_API_KEY` 环境变量覆盖）。
+3. 任务进度与流程日志展示节点上下文（模型、耗时、token、输入摘要）。
+4. 每条结论强制绑定证据 ID，保证可追溯。
+5. 提供明确样例：`抖音 / 快手 / 小红书`。

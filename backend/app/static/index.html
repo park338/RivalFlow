@@ -3,53 +3,80 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI 竞品分析 Agent 协作 Demo</title>
+    <title>RivalFlow Demo</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <main class="container">
       <section class="panel">
-        <h1>AI 竞品分析 Agent 协作 Demo</h1>
-        <p class="subtext">输入任务后，系统会自动执行多 Agent 流程并产出报告。</p>
+        <h1>RivalFlow 多 Agent 竞品分析 Demo</h1>
+        <p class="subtext">提交任务后，系统将自动执行 Planner / Collector / Analyst / Reviewer 全流程。</p>
+
         <form id="task-form" class="form-grid">
           <label>
             项目名
-            <input id="projectName" value="字节竞品分析 Demo" maxlength="100" />
+            <input id="projectName" value="短视频电商策略对比（抖音 vs 快手 vs 小红书）" maxlength="100" />
           </label>
+
           <label>
             行业
             <input id="industry" value="内容电商" maxlength="100" required />
           </label>
+
           <label>
             竞品（逗号分隔）
-            <input id="competitors" value="平台A,平台B,平台C" required />
+            <input id="competitors" value="抖音,快手,小红书" required />
           </label>
+
           <label>
-            分析维度（逗号分隔）
-            <input id="focusAreas" value="产品定位,用户体验,商业化能力,增长策略" />
+            分析维度（下拉多选）
+            <select id="focusAreas" multiple size="5">
+              <option value="产品定位" selected>产品定位</option>
+              <option value="用户体验" selected>用户体验</option>
+              <option value="商业化能力" selected>商业化能力</option>
+              <option value="增长策略" selected>增长策略</option>
+              <option value="技术能力">技术能力</option>
+            </select>
           </label>
+
+          <label>
+            时间范围（下拉）
+            <select id="timeRange">
+              <option value="近 3 个月">近 3 个月</option>
+              <option value="近 6 个月">近 6 个月</option>
+              <option value="近 12 个月" selected>近 12 个月</option>
+              <option value="近 24 个月">近 24 个月</option>
+            </select>
+          </label>
+
           <label>
             来源 URL（可选，逗号分隔）
-            <input id="sourceUrls" placeholder="https://example.com/a,https://example.com/b" />
+            <input
+              id="sourceUrls"
+              placeholder="https://www.douyin.com,https://www.kuaishou.com,https://www.xiaohongshu.com"
+            />
           </label>
-          <label>
-            时间范围
-            <input id="timeRange" value="近 12 个月" maxlength="50" />
-          </label>
+
           <div class="actions">
             <button id="submitBtn" type="submit">开始分析</button>
-            <button id="demoBtn" type="button" class="ghost">填充示例</button>
+            <button id="demoBtn" type="button" class="ghost">填充电商样例</button>
           </div>
         </form>
+
         <p id="message" class="message">准备就绪。</p>
       </section>
 
       <section class="panel">
         <h2>任务进度</h2>
         <div id="taskMeta" class="meta">暂无任务</div>
-        <ul id="nodes" class="nodes"></ul>
-        <h3>流程日志</h3>
-        <ul id="events" class="events"></ul>
+        <div id="timeline" class="timeline"></div>
+        <p class="timeline-hint">点击已执行节点，可查看该节点对应的详细流程日志。</p>
+        <div id="nodeDetail" class="node-detail hidden">
+          <h3 id="nodeDetailTitle">节点详情</h3>
+          <p id="nodeDetailSummary" class="node-detail-summary"></p>
+          <pre id="nodeDetailContext" class="node-context hidden"></pre>
+          <ul id="nodeEvents" class="events"></ul>
+        </div>
       </section>
 
       <section class="panel">

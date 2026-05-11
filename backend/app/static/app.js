@@ -3,8 +3,12 @@ const demoBtn = document.getElementById("demoBtn");
 const submitBtn = document.getElementById("submitBtn");
 const messageEl = document.getElementById("message");
 const taskMetaEl = document.getElementById("taskMeta");
-const nodesEl = document.getElementById("nodes");
-const eventsEl = document.getElementById("events");
+const timelineEl = document.getElementById("timeline");
+const nodeDetailEl = document.getElementById("nodeDetail");
+const nodeDetailTitleEl = document.getElementById("nodeDetailTitle");
+const nodeDetailSummaryEl = document.getElementById("nodeDetailSummary");
+const nodeDetailContextEl = document.getElementById("nodeDetailContext");
+const nodeEventsEl = document.getElementById("nodeEvents");
 const evidenceBodyEl = document.querySelector("#evidenceTable tbody");
 const reportEl = document.getElementById("report");
 const scorecardEl = document.getElementById("scorecard");
@@ -13,14 +17,16 @@ const scorecardWrapEl = document.getElementById("scorecardWrap");
 const claimsWrapEl = document.getElementById("claimsWrap");
 
 let pollingTimer = null;
+let selectedNodeKey = null;
+let latestTask = null;
 
 demoBtn.addEventListener("click", () => {
-  document.getElementById("projectName").value = "短视频电商竞品协作分析 Demo";
+  document.getElementById("projectName").value = "2026 短视频电商商业化策略对比（抖音 vs 快手 vs 小红书）";
   document.getElementById("industry").value = "内容电商";
-  document.getElementById("competitors").value = "平台A,平台B,平台C";
-  document.getElementById("focusAreas").value = "产品定位,用户体验,商业化能力,增长策略";
+  document.getElementById("competitors").value = "抖音,快手,小红书";
+  document.getElementById("sourceUrls").value = "https://www.douyin.com,https://www.kuaishou.com,https://www.xiaohongshu.com";
+  setSelectValues("focusAreas", ["产品定位", "用户体验", "商业化能力", "增长策略"]);
   document.getElementById("timeRange").value = "近 12 个月";
-  document.getElementById("sourceUrls").value = "";
 });
 
 form.addEventListener("submit", async (event) => {
@@ -30,6 +36,11 @@ form.addEventListener("submit", async (event) => {
     setMessage("请至少填写一个竞品名称。", true);
     return;
   }
+  if (!payload.focus_areas.length) {
+    setMessage("请至少选择一个分析维度。", true);
+    return;
+  }
+
   try {
     setLoading(true);
     setMessage("任务提交中...");
@@ -39,15 +50,15 @@ form.addEventListener("submit", async (event) => {
       body: JSON.stringify(payload),
     });
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(errorText || "任务创建失败");
+      throw new Error(await response.text());
     }
     const task = await response.json();
+    selectedNodeKey = null;
     setMessage(`任务已创建：${task.task_id}`);
     renderTask(task);
     startPolling(task.task_id);
   } catch (error) {
-    setMessage(`提交失败：${error.message}`, true);
+    setMessage(`提交失败：${error.message || "未知错误"}`, true);
     setLoading(false);
   }
 });
@@ -58,13 +69,15 @@ function buildPayload() {
       .split(/[,\n]/)
       .map((item) => item.trim())
       .filter(Boolean);
+
+  const focusAreas = Array.from(document.getElementById("focusAreas").selectedOptions).map((item) => item.value);
   return {
-    project_name: document.getElementById("projectName").value.trim() || "字节竞品分析 Demo",
+    project_name: document.getElementById("projectName").value.trim() || "RivalFlow 竞品分析 Demo",
     industry: document.getElementById("industry").value.trim(),
     competitors: toList(document.getElementById("competitors").value),
-    focus_areas: toList(document.getElementById("focusAreas").value),
+    focus_areas: focusAreas,
     source_urls: toList(document.getElementById("sourceUrls").value),
-    time_range: document.getElementById("timeRange").value.trim() || "近 12 个月",
+    time_range: document.getElementById("timeRange").value,
   };
 }
 
@@ -82,14 +95,13 @@ function startPolling(taskId) {
         setMessage("分析已完成。");
         setLoading(false);
         stopPolling();
-      }
-      if (task.status === "failed") {
+      } else if (task.status === "failed") {
         setMessage(`任务失败：${task.error_message || "未知错误"}`, true);
         setLoading(false);
         stopPolling();
       }
     } catch (error) {
-      setMessage(`轮询异常：${error.message}`, true);
+      setMessage(`轮询异常：${error.message || "未知错误"}`, true);
       setLoading(false);
       stopPolling();
     }
@@ -104,40 +116,151 @@ function stopPolling() {
 }
 
 function renderTask(task) {
-  taskMetaEl.textContent = `任务ID：${task.task_id} | 状态：${labelTaskStatus(task.status)} | 更新时间：${formatTime(task.updated_at)}`;
-  renderNodes(task.nodes || []);
-  renderEvents(task.events || []);
+  latestTask = task;
+  const model = task.result?.model_info?.analyst_model || "-";
+  taskMetaEl.textContent = `任务ID：${task.task_id} | 状态：${labelTaskStatus(task.status)} | 模型：${model} | 更新时间：${formatTime(task.updated_at)}`;
+
+  const nodes = task.nodes || [];
+  const runningNode = nodes.find((node) => node.status === "running");
+  const executedNodes = nodes.filter((node) => node.status !== "pending");
+
+  if (!selectedNodeKey) {
+    selectedNodeKey = runningNode?.key || executedNodes.at(-1)?.key || null;
+  } else {
+    const selectedNode = nodes.find((node) => node.key === selectedNodeKey);
+    if (!selectedNode || selectedNode.status === "pending") {
+      selectedNodeKey = runningNode?.key || executedNodes.at(-1)?.key || null;
+    }
+  }
+
+  renderTimeline(nodes);
+  renderNodeDetail(task, selectedNodeKey);
   renderEvidence(task.evidence || []);
   renderScorecard(task.result?.scorecard || {});
   renderClaims(task.result?.claims || []);
   reportEl.textContent = task.result?.markdown_report || "任务完成后展示。";
 }
 
-function renderNodes(nodes) {
-  nodesEl.innerHTML = "";
-  nodes.forEach((node) => {
+function renderTimeline(nodes) {
+  timelineEl.innerHTML = "";
+  if (!nodes.length) return;
+
+  const stepsEl = document.createElement("div");
+  stepsEl.className = "timeline-steps";
+
+  const visitedEnd = getVisitedEndIndex(nodes);
+  nodes.forEach((node, index) => {
+    const stepEl = document.createElement("div");
+    stepEl.className = "timeline-step";
+    if (index <= visitedEnd) {
+      stepEl.classList.add("visited");
+    }
+
+    const dot = document.createElement("button");
+    dot.type = "button";
+    dot.className = `timeline-dot status-${node.status}`;
+    dot.disabled = node.status === "pending";
+    dot.title = node.status === "pending" ? "该节点尚未执行" : "点击查看该节点详细日志";
+    if (node.key === selectedNodeKey) {
+      dot.classList.add("selected");
+    }
+    if (node.status !== "pending") {
+      dot.addEventListener("click", () => {
+        selectedNodeKey = node.key;
+        renderTimeline(latestTask?.nodes || []);
+        renderNodeDetail(latestTask, selectedNodeKey);
+      });
+    }
+
+    const name = document.createElement("div");
+    name.className = "timeline-name";
+    name.textContent = node.label;
+
+    const status = document.createElement("div");
+    status.className = `timeline-status status-text-${node.status}`;
+    status.textContent = labelTaskStatus(node.status);
+
+    stepEl.appendChild(dot);
+    stepEl.appendChild(name);
+    stepEl.appendChild(status);
+    stepsEl.appendChild(stepEl);
+  });
+
+  timelineEl.appendChild(stepsEl);
+}
+
+function renderNodeDetail(task, nodeKey) {
+  if (!task || !nodeKey) {
+    nodeDetailEl.classList.add("hidden");
+    return;
+  }
+
+  const nodes = task.nodes || [];
+  const node = nodes.find((item) => item.key === nodeKey);
+  if (!node || node.status === "pending") {
+    nodeDetailEl.classList.add("hidden");
+    return;
+  }
+
+  nodeDetailEl.classList.remove("hidden");
+  nodeDetailTitleEl.textContent = `${node.label} · ${labelTaskStatus(node.status)}`;
+
+  const summaryParts = [];
+  if (node.summary) summaryParts.push(node.summary);
+  if (node.started_at) summaryParts.push(`开始：${formatTime(node.started_at)}`);
+  if (node.finished_at) summaryParts.push(`结束：${formatTime(node.finished_at)}`);
+  if (node.context?.duration_ms) summaryParts.push(`耗时：${node.context.duration_ms}ms`);
+  nodeDetailSummaryEl.textContent = summaryParts.join(" | ");
+
+  const contextText = getContextText(node.context || {});
+  if (contextText) {
+    nodeDetailContextEl.classList.remove("hidden");
+    nodeDetailContextEl.textContent = contextText;
+  } else {
+    nodeDetailContextEl.classList.add("hidden");
+    nodeDetailContextEl.textContent = "";
+  }
+
+  const nodeEvents = (task.events || [])
+    .filter((event) => event.node_key === nodeKey)
+    .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+
+  nodeEventsEl.innerHTML = "";
+  if (!nodeEvents.length) {
     const li = document.createElement("li");
-    li.className = "node";
+    li.className = "event";
+    li.textContent = "该节点暂时没有可展示的日志。";
+    nodeEventsEl.appendChild(li);
+    return;
+  }
+
+  nodeEvents.forEach((event) => {
+    const li = document.createElement("li");
+    li.className = "event";
+    const context = getContextText(event.context || {});
     li.innerHTML = `
-      <div class="node-title">
-        <span>${escapeHtml(node.label)}</span>
-        <span class="node-status status-${node.status}">${labelTaskStatus(node.status)}</span>
+      <div class="event-head">
+        <span>[${formatTime(event.at)}]</span>
+        <span class="event-tags">${escapeHtml(event.stage || "progress")}</span>
       </div>
-      <div class="node-summary">${escapeHtml(node.summary || "")}</div>
+      <div>${escapeHtml(event.message || "")}</div>
+      ${context ? `<pre class="event-context">${escapeHtml(context)}</pre>` : ""}
     `;
-    nodesEl.appendChild(li);
+    nodeEventsEl.appendChild(li);
   });
 }
 
-function renderEvents(events) {
-  const ordered = [...events].reverse().slice(0, 12);
-  eventsEl.innerHTML = "";
-  ordered.forEach((event) => {
-    const li = document.createElement("li");
-    li.className = "event";
-    li.textContent = `[${formatTime(event.at)}] ${event.message}`;
-    eventsEl.appendChild(li);
-  });
+function getVisitedEndIndex(nodes) {
+  let end = -1;
+  for (let index = 0; index < nodes.length; index += 1) {
+    const status = nodes[index].status;
+    if (status === "completed" || status === "running" || status === "failed") {
+      end = index;
+    } else {
+      break;
+    }
+  }
+  return end;
 }
 
 function renderEvidence(evidence) {
@@ -188,8 +311,10 @@ function renderClaims(claims) {
     return;
   }
   claims.forEach((claim) => {
+    const evidenceText = (claim.evidence_ids || []).join(", ");
     const li = document.createElement("li");
-    li.textContent = `${claim.title}：${claim.detail}（置信度 ${Number(claim.confidence).toFixed(2)}）`;
+    li.className = "claim-item";
+    li.textContent = `${claim.title}：${claim.detail}（置信度 ${Number(claim.confidence).toFixed(2)}，证据ID: ${evidenceText}）`;
     claimsEl.appendChild(li);
   });
   claimsWrapEl.classList.remove("hidden");
@@ -216,6 +341,19 @@ function formatTime(isoTime) {
   if (!isoTime) return "-";
   const date = new Date(isoTime);
   return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function getContextText(context) {
+  if (!context || !Object.keys(context).length) return "";
+  return JSON.stringify(context, null, 2);
+}
+
+function setSelectValues(selectId, values) {
+  const selected = new Set(values);
+  const select = document.getElementById(selectId);
+  Array.from(select.options).forEach((option) => {
+    option.selected = selected.has(option.value);
+  });
 }
 
 function escapeHtml(value) {

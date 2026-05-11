@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .ai_client import DeepSeekClient
 from .models import TaskCreateRequest, TaskDetail
 from .pipeline import PipelineRunner
 from .storage import TaskStore
@@ -17,9 +18,9 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(
-    title="Bytedance Multi-Agent Demo",
+    title="RivalFlow Demo",
     description="AI 驱动竞品分析 Agent 协作系统 Demo",
-    version="0.1.0",
+    version="0.2.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +30,8 @@ app.add_middleware(
 )
 
 store = TaskStore()
-runner = PipelineRunner(store)
+deepseek_client = DeepSeekClient()
+runner = PipelineRunner(store=store, ai_client=deepseek_client)
 
 
 @app.get("/api/health")
