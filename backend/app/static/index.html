@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI 竞品分析 Agent 协作 Demo</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <section class="panel">
+        <h1>AI 竞品分析 Agent 协作 Demo</h1>
+        <p class="subtext">输入任务后，系统会自动执行多 Agent 流程并产出报告。</p>
+        <form id="task-form" class="form-grid">
+          <label>
+            项目名
+            <input id="projectName" value="字节竞品分析 Demo" maxlength="100" />
+          </label>
+          <label>
+            行业
+            <input id="industry" value="内容电商" maxlength="100" required />
+          </label>
+          <label>
+            竞品（逗号分隔）
+            <input id="competitors" value="平台A,平台B,平台C" required />
+          </label>
+          <label>
+            分析维度（逗号分隔）
+            <input id="focusAreas" value="产品定位,用户体验,商业化能力,增长策略" />
+          </label>
+          <label>
+            来源 URL（可选，逗号分隔）
+            <input id="sourceUrls" placeholder="https://example.com/a,https://example.com/b" />
+          </label>
+          <label>
+            时间范围
+            <input id="timeRange" value="近 12 个月" maxlength="50" />
+          </label>
+          <div class="actions">
+            <button id="submitBtn" type="submit">开始分析</button>
+            <button id="demoBtn" type="button" class="ghost">填充示例</button>
+          </div>
+        </form>
+        <p id="message" class="message">准备就绪。</p>
+      </section>
+
+      <section class="panel">
+        <h2>任务进度</h2>
+        <div id="taskMeta" class="meta">暂无任务</div>
+        <ul id="nodes" class="nodes"></ul>
+        <h3>流程日志</h3>
+        <ul id="events" class="events"></ul>
+      </section>
+
+      <section class="panel">
+        <h2>结构化结果</h2>
+        <div id="scorecardWrap" class="hidden">
+          <h3>评分卡</h3>
+          <div id="scorecard"></div>
+        </div>
+        <div id="claimsWrap" class="hidden">
+          <h3>核心结论</h3>
+          <ul id="claims"></ul>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>证据链</h2>
+        <div class="table-wrap">
+          <table id="evidenceTable">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>竞品</th>
+                <th>维度</th>
+                <th>来源</th>
+                <th>置信度</th>
+                <th>证据片段</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>最终报告</h2>
+        <pre id="report" class="report">任务完成后展示。</pre>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
