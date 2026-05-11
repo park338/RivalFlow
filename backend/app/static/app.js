@@ -449,7 +449,7 @@ function markdownToHtml(markdownText) {
       continue;
     }
 
-    if (line.includes("|") && index + 1 < lines.length && /^\|?[\s:-|]+\|?$/.test(lines[index + 1].trim())) {
+    if (line.includes("|") && index + 1 < lines.length && /^\|?[\s:\-|]+\|?$/.test(lines[index + 1].trim())) {
       const headerCells = parseTableRow(line);
       index += 2;
       const rows = [];
