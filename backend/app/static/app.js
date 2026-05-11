@@ -449,16 +449,29 @@ function markdownToHtml(markdownText) {
       continue;
     }
 
-    if (line.includes("|") && index + 1 < lines.length && /^\|?[\s:\-|]+\|?$/.test(lines[index + 1].trim())) {
+    if (line.startsWith("|") && line.endsWith("|")) {
+      const nextLine = index + 1 < lines.length ? lines[index + 1].trim() : "";
+      const hasSeparator = /^\|?[\s:\-|]+\|?$/.test(nextLine);
+      const hasPipeRows = nextLine.startsWith("|");
+      if (hasSeparator || hasPipeRows) {
       const headerCells = parseTableRow(line);
-      index += 2;
+      index += hasSeparator ? 2 : 1;
       const rows = [];
-      while (index < lines.length && lines[index].includes("|")) {
-        rows.push(parseTableRow(lines[index]));
+      while (index < lines.length) {
+        const rowLine = lines[index].trim();
+        if (!rowLine.startsWith("|")) {
+          break;
+        }
+        if (/^\|?[\s:\-|]+\|?$/.test(rowLine)) {
+          index += 1;
+          continue;
+        }
+        rows.push(parseTableRow(rowLine));
         index += 1;
       }
       html.push(buildTableHtml(headerCells, rows));
       continue;
+      }
     }
 
     if (line.startsWith("- ")) {
