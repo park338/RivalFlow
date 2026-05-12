@@ -191,33 +191,65 @@ class PipelineRunner:
         await self._start_node(
             task_id,
             "structurer",
-            "正在按 Schema 结构化证据",
-            context={"focus_areas": focus_areas},
+            "正在使用 DeepSeek 基于证据评分",
+            context={
+                "focus_areas": focus_areas,
+                "evidence_count": len(evidence),
+                "model": self.ai_client.model,
+            },
         )
-        await asyncio.sleep(0.2)
 
-        evidence_map: dict[str, dict[str, list[EvidenceItem]]] = defaultdict(lambda: defaultdict(list))
-        for item in evidence:
-            evidence_map[item.competitor][item.focus_area].append(item)
-
-        scorecard: dict[str, dict[str, int]] = {}
-        for competitor in task.input.competitors:
-            scorecard[competitor] = {}
-            for focus_area in focus_areas:
-                samples = evidence_map[competitor][focus_area]
-                if not samples:
-                    scorecard[competitor][focus_area] = 60
-                    continue
-                avg_conf = mean(item.confidence for item in samples)
-                raw = 58 + int(avg_conf * 35) + self._stable_score(competitor, focus_area, task.input.time_range) % 8
-                scorecard[competitor][focus_area] = min(95, raw)
+        scorecard: dict[str, dict[str, int]]
+        scoring_details: list[dict[str, Any]]
+        try:
+            user_prompt = self._build_structurer_prompt(task, evidence, focus_areas)
+            await self._append_event(
+                task_id,
+                "info",
+                "Structurer 正在请求 LLM 评分",
+                node_key="structurer",
+                stage="llm_request",
+                context={
+                    "model": self.ai_client.model,
+                    "evidence_count": len(evidence),
+                    "payload_size": len(user_prompt),
+                },
+            )
+            payload, trace = await self.ai_client.complete_json(
+                system_prompt=(
+                    "你是严谨的竞品评分专家。只能基于用户提供的证据评分，不允许补充外部事实。"
+                    "没有证据时必须标记 missing_info，不能编造理由。请严格返回 JSON。"
+                ),
+                user_prompt=user_prompt,
+                max_tokens=1800,
+                temperature=0.1,
+            )
+            await self._append_llm_event(task_id, "structurer", "llm_response", trace)
+            scorecard, scoring_details = self._parse_structurer_scores(task, focus_areas, evidence, payload)
+        except Exception as exc:
+            scorecard, scoring_details = self._fallback_structurer_scores(task, focus_areas, evidence)
+            await self._append_event(
+                task_id,
+                "warning",
+                "Structurer 使用透明兜底评分（LLM评分异常）",
+                node_key="structurer",
+                stage="llm_fallback",
+                context={"error": str(exc)},
+            )
 
         await self._merge_result(task_id, lambda result: result.scorecard.update(scorecard))
+        await self._merge_result(
+            task_id,
+            lambda result: result.model_info.update({"structurer_model": self.ai_client.model}),
+        )
         await self._finish_node(
             task_id,
             "structurer",
             "结构化评分完成",
-            context={"matrix_preview": scorecard},
+            context={
+                "matrix_preview": scorecard,
+                "scoring_details": scoring_details,
+            },
         )
         return scorecard
 
@@ -573,6 +605,193 @@ class PipelineRunner:
         if isinstance(parsed, (dict, list)):
             return parsed
         return None
+
+    def _build_structurer_prompt(
+        self,
+        task: TaskDetail,
+        evidence: list[EvidenceItem],
+        focus_areas: list[str],
+    ) -> str:
+        compact_evidence = [
+            {
+                "evidence_id": item.evidence_id,
+                "competitor": item.competitor,
+                "focus_area": item.focus_area,
+                "source_url": item.source_url,
+                "snippet": item.snippet,
+                "confidence": item.confidence,
+            }
+            for item in evidence[:60]
+        ]
+        payload = {
+            "task": {
+                "industry": task.input.industry,
+                "competitors": task.input.competitors,
+                "focus_areas": focus_areas,
+                "time_range": task.input.time_range,
+            },
+            "evidence": compact_evidence,
+            "scoring_rules": [
+                "必须为每个 competitor x focus_area 输出一条评分。",
+                "score 必须是 0 到 100 的整数。",
+                "必须引用该 competitor 和 focus_area 下真实存在的 evidence_id。",
+                "证据不足时 score 使用 50，并在 missing_info 中说明缺什么，不能编造事实。",
+                "reason 只能解释已给证据能支持什么，不能引入外部资料。",
+            ],
+            "output_schema": {
+                "scores": [
+                    {
+                        "competitor": "竞品名",
+                        "focus_area": "维度",
+                        "score": 50,
+                        "reason": "评分理由",
+                        "evidence_ids": ["ev-001"],
+                        "confidence": 0.0,
+                        "missing_info": "缺失信息说明，可为空",
+                    }
+                ]
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _parse_structurer_scores(
+        self,
+        task: TaskDetail,
+        focus_areas: list[str],
+        evidence: list[EvidenceItem],
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, dict[str, int]], list[dict[str, Any]]]:
+        evidence_by_pair = self._group_evidence_by_pair(evidence)
+        valid_ids_by_pair = {
+            pair: {item.evidence_id for item in items}
+            for pair, items in evidence_by_pair.items()
+        }
+        raw_scores = payload.get("scores") or []
+
+        scorecard: dict[str, dict[str, int]] = {competitor: {} for competitor in task.input.competitors}
+        details: list[dict[str, Any]] = []
+        accepted_pairs: set[tuple[str, str]] = set()
+
+        for raw in raw_scores:
+            if not isinstance(raw, dict):
+                continue
+            competitor = str(raw.get("competitor", "")).strip()
+            focus_area = str(raw.get("focus_area", "")).strip()
+            pair = (competitor, focus_area)
+            if competitor not in task.input.competitors or focus_area not in focus_areas or pair in accepted_pairs:
+                continue
+
+            allowed_ids = valid_ids_by_pair.get(pair, set())
+            evidence_ids = [
+                item for item in raw.get("evidence_ids", [])
+                if isinstance(item, str) and item in allowed_ids
+            ]
+            if not evidence_ids:
+                continue
+
+            score = self._clamp_score(raw.get("score", 50))
+            detail = {
+                "competitor": competitor,
+                "focus_area": focus_area,
+                "score": score,
+                "reason": str(raw.get("reason", "")).strip() or "模型基于绑定证据给出评分。",
+                "evidence_ids": evidence_ids,
+                "confidence": self._clamp_float(raw.get("confidence", 0.7), 0.7),
+                "missing_info": str(raw.get("missing_info", "")).strip(),
+                "method": "llm_evidence_based",
+            }
+            scorecard[competitor][focus_area] = score
+            details.append(detail)
+            accepted_pairs.add(pair)
+
+        for competitor in task.input.competitors:
+            for focus_area in focus_areas:
+                pair = (competitor, focus_area)
+                if pair in accepted_pairs:
+                    continue
+                samples = evidence_by_pair.get(pair, [])
+                score, detail = self._build_transparent_fallback_score(competitor, focus_area, samples)
+                scorecard[competitor][focus_area] = score
+                details.append(detail)
+
+        return scorecard, details
+
+    def _fallback_structurer_scores(
+        self,
+        task: TaskDetail,
+        focus_areas: list[str],
+        evidence: list[EvidenceItem],
+    ) -> tuple[dict[str, dict[str, int]], list[dict[str, Any]]]:
+        evidence_by_pair = self._group_evidence_by_pair(evidence)
+        scorecard: dict[str, dict[str, int]] = {competitor: {} for competitor in task.input.competitors}
+        details: list[dict[str, Any]] = []
+        for competitor in task.input.competitors:
+            for focus_area in focus_areas:
+                score, detail = self._build_transparent_fallback_score(
+                    competitor,
+                    focus_area,
+                    evidence_by_pair.get((competitor, focus_area), []),
+                )
+                scorecard[competitor][focus_area] = score
+                details.append(detail)
+        return scorecard, details
+
+    @staticmethod
+    def _group_evidence_by_pair(evidence: list[EvidenceItem]) -> dict[tuple[str, str], list[EvidenceItem]]:
+        grouped: dict[tuple[str, str], list[EvidenceItem]] = defaultdict(list)
+        for item in evidence:
+            grouped[(item.competitor, item.focus_area)].append(item)
+        return grouped
+
+    def _build_transparent_fallback_score(
+        self,
+        competitor: str,
+        focus_area: str,
+        samples: list[EvidenceItem],
+    ) -> tuple[int, dict[str, Any]]:
+        if not samples:
+            score = 50
+            detail = {
+                "competitor": competitor,
+                "focus_area": focus_area,
+                "score": score,
+                "reason": "缺少该竞品在该维度的有效证据，使用中性基线分；该分数不代表真实能力水平。",
+                "evidence_ids": [],
+                "confidence": 0.0,
+                "missing_info": "需要补充该竞品在该维度的可验证来源。",
+                "method": "insufficient_evidence_baseline",
+            }
+            return score, detail
+
+        avg_conf = mean(item.confidence for item in samples)
+        score = min(85, round(55 + avg_conf * 25 + min(len(samples), 3) * 3))
+        detail = {
+            "competitor": competitor,
+            "focus_area": focus_area,
+            "score": score,
+            "reason": "LLM 未返回可校验评分时，系统仅基于证据数量和证据置信度给出保守分。",
+            "evidence_ids": [item.evidence_id for item in samples[:3]],
+            "confidence": round(avg_conf, 2),
+            "missing_info": "该评分未使用外部事实，建议补充更多来源后复评。",
+            "method": "transparent_confidence_fallback",
+        }
+        return score, detail
+
+    @staticmethod
+    def _clamp_score(value: Any) -> int:
+        try:
+            score = int(round(float(value)))
+        except (TypeError, ValueError):
+            score = 50
+        return max(0, min(score, 100))
+
+    @staticmethod
+    def _clamp_float(value: Any, default: float) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            result = default
+        return round(max(0.0, min(result, 1.0)), 2)
 
     def _build_analyst_prompt(
         self,
