@@ -157,8 +157,13 @@ class PipelineRunner:
         await self._start_node(
             task_id,
             "collector",
-            "正在从真实页面采集可追溯证据",
-            context={"source_urls_count": len(task.input.source_urls), "competitor_count": len(task.input.competitors)},
+            "正在整理公共信息并生成可追溯证据",
+            context={
+                "source_urls_count": len(task.input.source_urls),
+                "public_material_count": len(task.input.public_materials),
+                "competitor_count": len(task.input.competitors),
+                "network_fetch": "disabled",
+            },
         )
 
         output = await self.real_collector.collect(task)
@@ -176,7 +181,7 @@ class PipelineRunner:
         await self._finish_node(
             task_id,
             "collector",
-            f"完成真实证据采集，共 {len(output.evidence)} 条",
+            f"完成公共信息采集，共 {len(output.evidence)} 条证据",
             context=output.context,
         )
         return output.evidence

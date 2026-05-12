@@ -32,6 +32,7 @@ demoBtn.addEventListener("click", () => {
   document.getElementById("industry").value = "内容电商";
   document.getElementById("competitors").value = "抖音,快手,小红书";
   document.getElementById("sourceUrls").value = "https://www.douyin.com,https://www.kuaishou.com,https://www.xiaohongshu.com";
+  document.getElementById("publicMaterials").value = buildDemoPublicMaterials();
   setFocusAreas(["产品定位", "用户体验", "商业化能力", "增长策略"]);
   document.getElementById("timeRange").value = "近 12 个月";
 });
@@ -76,6 +77,11 @@ function buildPayload() {
       .split(/[,\n]/)
       .map((item) => item.trim())
       .filter(Boolean);
+  const toMaterialList = (value) =>
+    value
+      .split(/\n\s*\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
 
   const focusAreas = Array.from(selectedFocusAreas);
   return {
@@ -84,8 +90,17 @@ function buildPayload() {
     competitors: toList(document.getElementById("competitors").value),
     focus_areas: focusAreas,
     source_urls: toList(document.getElementById("sourceUrls").value),
+    public_materials: toMaterialList(document.getElementById("publicMaterials").value),
     time_range: document.getElementById("timeRange").value,
   };
+}
+
+function buildDemoPublicMaterials() {
+  return [
+    "抖音电商公开资料样例：抖音电商围绕短视频内容、直播互动、达人带货和店铺经营形成交易链路。平台面向商家提供商品发布、内容经营、直播转化、营销活动和经营数据等工具，帮助品牌在内容场景中触达用户。在用户体验上，商品展示、达人讲解、评论互动和下单路径结合在同一内容消费流程内。在商业化能力上，广告投放、达人合作和电商交易共同支撑品牌增长。",
+    "快手电商公开资料样例：快手电商强调信任关系、直播间互动和商家长期经营，平台通过达人、店铺、短视频和直播形成转化链路。商家可以围绕粉丝关系进行内容运营、商品讲解、售后服务和复购管理。在用户体验上，直播讲解、评论互动和交易服务更强调实时沟通。在增长策略上，快手生态重视私域沉淀、达人协作和商家经营效率。",
+    "小红书公开资料样例：小红书围绕生活方式社区、内容种草、搜索发现和品牌合作建立产品定位。平台通过笔记内容、用户评论、收藏分享和搜索链路帮助用户完成消费决策。蒲公英等商业合作能力连接品牌与创作者，支持内容合作、投放管理和效果评估。在增长策略上，小红书强调社区内容质量、真实体验分享和用户兴趣发现。",
+  ].join("\\n\\n");
 }
 
 function startPolling(taskId) {
@@ -272,13 +287,22 @@ function getVisitedEndIndex(nodes) {
 
 function renderEvidence(evidence) {
   evidenceBodyEl.innerHTML = "";
+  if (!evidence.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="6">暂无可展示证据。</td>`;
+    evidenceBodyEl.appendChild(tr);
+    return;
+  }
   evidence.forEach((item) => {
     const tr = document.createElement("tr");
+    const sourceHtml = isHttpUrl(item.source_url)
+      ? `<a href="${escapeAttr(item.source_url)}" target="_blank" rel="noreferrer">${escapeHtml(item.source_name)}</a>`
+      : `${escapeHtml(item.source_name)}<div class="source-note">${escapeHtml(item.source_url)}</div>`;
     tr.innerHTML = `
       <td>${escapeHtml(item.evidence_id)}</td>
       <td>${escapeHtml(item.competitor)}</td>
       <td>${escapeHtml(item.focus_area)}</td>
-      <td><a href="${escapeAttr(item.source_url)}" target="_blank" rel="noreferrer">${escapeHtml(item.source_name)}</a></td>
+      <td>${sourceHtml}</td>
       <td>${Number(item.confidence).toFixed(2)}</td>
       <td>${escapeHtml(item.snippet)}</td>
     `;
@@ -575,4 +599,8 @@ function escapeHtml(value) {
 
 function escapeAttr(value) {
   return escapeHtml(value).replaceAll("`", "");
+}
+
+function isHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value || ""));
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
@@ -29,6 +30,7 @@ class TaskCreateRequest(BaseModel):
     competitors: list[str] = Field(..., min_length=1)
     focus_areas: list[str] = Field(default_factory=lambda: DEFAULT_FOCUS_AREAS.copy())
     source_urls: list[str] = Field(default_factory=list)
+    public_materials: list[str] = Field(default_factory=list)
     time_range: str = Field(default="近 12 个月", max_length=50)
 
     @field_validator("competitors", mode="before")
@@ -56,6 +58,18 @@ class TaskCreateRequest(BaseModel):
             raw_items = [str(item).strip() for item in value]
         unique = list(dict.fromkeys([item for item in raw_items if item]))
         return unique
+
+    @field_validator("public_materials", mode="before")
+    @classmethod
+    def normalize_public_materials(cls, value: list[str] | str | None) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_items = re.split(r"\n\s*\n", value)
+        else:
+            raw_items = [str(item) for item in value]
+        cleaned = [item.strip() for item in raw_items if item.strip()]
+        return list(dict.fromkeys(cleaned))
 
 
 class PipelineNode(BaseModel):

@@ -70,19 +70,36 @@ label {
 }
 
 input,
-select {
+select,
+textarea {
   border: 1px solid #c6d0e5;
   border-radius: 6px;
   padding: 10px;
   font-size: 14px;
-  min-height: 38px;
   background: #fff;
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   outline: 2px solid #c3d4ff;
   border-color: #9ab7ff;
+}
+
+input,
+select {
+  min-height: 38px;
+}
+
+textarea {
+  min-height: 128px;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.6;
+}
+
+.wide-field {
+  grid-column: 1 / -1;
 }
 
 .tag-selector {
@@ -335,6 +352,12 @@ th {
 
 .claim-item {
   margin: 6px 0;
+}
+
+.source-note {
+  margin-top: 4px;
+  color: #64728d;
+  font-size: 12px;
 }
 
 .report-head {

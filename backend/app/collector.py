@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import re
@@ -8,9 +7,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-import httpx
 from bs4 import BeautifulSoup
 
 from .ai_client import DeepSeekClient
@@ -26,22 +24,47 @@ OFFICIAL_SOURCE_MAP = {
 }
 
 
-COLLECTION_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36 RivalFlow/0.1"
+SAMPLE_PUBLIC_MATERIALS = {
+    "抖音": (
+        "抖音电商公开资料样例：抖音电商围绕短视频内容、直播互动、达人带货和店铺经营形成交易链路。"
+        "平台面向商家提供商品发布、内容经营、直播转化、营销活动和经营数据等工具，帮助品牌在内容场景中触达用户。"
+        "在用户体验上，商品展示、达人讲解、评论互动和下单路径结合在同一内容消费流程内。"
+        "在商业化能力上，广告投放、达人合作和电商交易共同支撑品牌增长。"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+    "快手": (
+        "快手电商公开资料样例：快手电商强调信任关系、直播间互动和商家长期经营，平台通过达人、店铺、短视频和直播形成转化链路。"
+        "商家可以围绕粉丝关系进行内容运营、商品讲解、售后服务和复购管理。"
+        "在用户体验上，直播讲解、评论互动和交易服务更强调实时沟通。"
+        "在增长策略上，快手生态重视私域沉淀、达人协作和商家经营效率。"
+    ),
+    "小红书": (
+        "小红书公开资料样例：小红书围绕生活方式社区、内容种草、搜索发现和品牌合作建立产品定位。"
+        "平台通过笔记内容、用户评论、收藏分享和搜索链路帮助用户完成消费决策。"
+        "蒲公英等商业合作能力连接品牌与创作者，支持内容合作、投放管理和效果评估。"
+        "在增长策略上，小红书强调社区内容质量、真实体验分享和用户兴趣发现。"
+    ),
+    "淘宝": (
+        "淘宝公开资料样例：淘宝面向消费者和商家提供综合电商交易平台能力，覆盖商品搜索、店铺经营、营销活动、会员运营和售后服务。"
+        "平台通过丰富商品供给、搜索推荐、内容化频道和促销活动提升用户决策效率。"
+        "商家侧工具覆盖商品管理、流量获取、客户服务和经营分析。"
+        "在商业化能力上，广告、交易佣金和生态服务共同支撑平台经营。"
+    ),
+    "京东": (
+        "京东公开资料样例：京东以自营、供应链、物流履约和品质服务作为核心差异化能力。"
+        "平台面向用户提供商品搜索、正品保障、配送履约、售后服务和会员权益。"
+        "商家侧能力覆盖店铺经营、营销投放、仓配协同和经营数据分析。"
+        "在用户体验上，配送时效、售后可靠性和服务标准化是重要优势。"
+    ),
 }
 
 
 @dataclass(slots=True)
-class SourceCandidate:
-    url: str
+class SourceSuggestion:
     competitor: str
+    material_type: str
+    suggested_source: str
     reason: str
+    priority: str = "medium"
 
 
 @dataclass(slots=True)
@@ -68,35 +91,40 @@ class RealCollector:
 
     async def collect(self, task: TaskDetail) -> CollectionOutput:
         focus_areas = task.input.focus_areas or DEFAULT_FOCUS_AREAS
-        candidates, planning_events, planning_mode = await self._plan_sources(task, focus_areas)
+        suggestions, planning_events, planning_mode = await self._plan_public_sources(task, focus_areas)
+        documents, intake_events, intake_mode = self._build_public_documents(task, focus_areas)
         events: list[dict[str, Any]] = [
             *planning_events,
+            *intake_events,
             {
-                "message": f"已生成 {len(candidates)} 个候选来源",
+                "message": f"公共信息采集完成，整理出 {len(documents)} 份可分析资料",
+                "stage": "public_materials_ready",
                 "context": {
                     "planning_mode": planning_mode,
-                    "candidate_count": len(candidates),
-                    "candidate_preview": [
+                    "intake_mode": intake_mode,
+                    "suggested_source_count": len(suggestions),
+                    "document_count": len(documents),
+                    "document_preview": [
                         {
+                            "doc_id": item.doc_id,
                             "competitor": item.competitor,
-                            "url": item.url,
-                            "reason": item.reason,
+                            "title": item.title,
+                            "source": item.url,
+                            "text_length": len(item.text),
                         }
-                        for item in candidates[:8]
+                        for item in documents[:8]
                     ],
                 },
-            }
+            },
         ]
-
-        documents, fetch_events = await self._fetch_documents(candidates, focus_areas)
-        events.extend(fetch_events)
 
         evidence = await self._extract_evidence(task, documents, focus_areas)
         if not evidence:
             events.append(
                 {
                     "level": "warning",
-                    "message": "真实页面证据不足，已从有效正文中生成保守证据",
+                    "message": "公开资料证据不足，已从有效资料正文中生成保守证据",
+                    "stage": "evidence_fallback",
                     "context": {"document_count": len(documents)},
                 }
             )
@@ -108,7 +136,8 @@ class RealCollector:
                 evidence = self._merge_evidence(evidence, fallback_items, minimum_expected)
                 events.append(
                     {
-                        "message": "真实证据数量偏少，已从有效正文补充证据片段",
+                        "message": "公开资料证据数量偏少，已从有效正文补充证据片段",
+                        "stage": "evidence_supplement",
                         "context": {
                             "minimum_expected": minimum_expected,
                             "evidence_count": len(evidence),
@@ -117,77 +146,85 @@ class RealCollector:
                 )
 
         context = {
-            "mode": "real_web_collect",
+            "mode": "public_info_intake",
             "planning_mode": planning_mode,
-            "candidate_count": len(candidates),
+            "intake_mode": intake_mode,
+            "network_fetch": "disabled",
+            "user_material_count": len(task.input.public_materials),
+            "source_reference_count": len(task.input.source_urls),
+            "suggested_source_count": len(suggestions),
             "document_count": len(documents),
             "evidence_count": len(evidence),
-            "successful_urls": [doc.url for doc in documents[:8]],
+            "source_names": [doc.title for doc in documents[:8]],
         }
         return CollectionOutput(evidence=evidence, context=context, events=events)
 
-    async def _plan_sources(
+    async def _plan_public_sources(
         self,
         task: TaskDetail,
         focus_areas: list[str],
-    ) -> tuple[list[SourceCandidate], list[dict[str, Any]], str]:
+    ) -> tuple[list[SourceSuggestion], list[dict[str, Any]], str]:
         events: list[dict[str, Any]] = [
             {
-                "message": "Collector 正在使用 LLM 规划候选来源",
-                "stage": "source_planning_request",
+                "message": "Collector 正在规划公开资料清单",
+                "stage": "public_source_planning_request",
                 "context": {
                     "model": self.ai_client.model,
                     "competitors": task.input.competitors,
                     "focus_areas": focus_areas,
-                    "user_url_count": len(task.input.source_urls),
+                    "user_material_count": len(task.input.public_materials),
+                    "source_reference_count": len(task.input.source_urls),
+                    "network_fetch": "disabled",
                 },
             }
         ]
 
         try:
-            prompt = self._build_source_planning_prompt(task, focus_areas)
+            prompt = self._build_public_source_prompt(task, focus_areas)
             payload, trace = await self.ai_client.complete_json(
                 system_prompt=(
-                    "你是竞品研究资料规划助手。你只负责规划可抓取的公开网页来源，不负责编造证据。"
-                    "返回的 URL 应该优先包含产品、业务、创作者、商业化、帮助中心、新闻稿等高信号页面。"
-                    "不要返回法律声明、隐私政策、用户协议、备案、证照、登录页、robots.txt 或 sitemap.xml。"
+                    "你是竞品研究的公开资料采集规划助手。"
+                    "你只输出建议用户补充或核对的公开资料清单，不访问网页，不爬取网站，不编造证据。"
+                    "建议应覆盖产品定位、用户体验、商业化能力、增长策略等分析维度。"
                     "必须严格返回 JSON。"
                 ),
                 user_prompt=prompt,
-                max_tokens=1600,
+                max_tokens=1200,
                 temperature=0.1,
             )
-            candidates = self._parse_source_plan(task, payload)
-            if not candidates:
-                raise ValueError("LLM source plan returned no valid candidates")
+            suggestions = self._parse_source_suggestions(task, payload)
+            if not suggestions:
+                raise ValueError("public source plan returned no valid suggestions")
             events.append(
                 {
-                    "message": "Collector 已完成 LLM 候选来源规划",
-                    "stage": "source_planning_response",
+                    "message": "Collector 已完成公开资料清单规划",
+                    "stage": "public_source_planning_response",
                     "context": {
                         "model": trace.model,
                         "latency_ms": trace.latency_ms,
-                        "candidate_count": len(candidates),
+                        "suggestion_count": len(suggestions),
+                        "suggestion_preview": [self._suggestion_to_context(item) for item in suggestions[:8]],
                     },
                 }
             )
-            return candidates, events, "llm_source_planning"
+            return suggestions, events, "llm_public_source_planning"
         except Exception as exc:
-            candidates = self._fallback_plan_sources(task)
+            suggestions = self._fallback_public_source_suggestions(task, focus_areas)
             events.append(
                 {
                     "level": "warning",
-                    "message": "Collector 使用保守兜底来源规划（LLM规划异常）",
-                    "stage": "source_planning_fallback",
+                    "message": "Collector 使用保守公开资料清单（LLM规划异常）",
+                    "stage": "public_source_planning_fallback",
                     "context": {
                         "error": f"{type(exc).__name__}: {exc}",
-                        "candidate_count": len(candidates),
+                        "suggestion_count": len(suggestions),
+                        "suggestion_preview": [self._suggestion_to_context(item) for item in suggestions[:8]],
                     },
                 }
             )
-            return candidates, events, "fallback_source_planning"
+            return suggestions, events, "fallback_public_source_planning"
 
-    def _build_source_planning_prompt(self, task: TaskDetail, focus_areas: list[str]) -> str:
+    def _build_public_source_prompt(self, task: TaskDetail, focus_areas: list[str]) -> str:
         payload = {
             "task": {
                 "project_name": task.input.project_name,
@@ -196,242 +233,234 @@ class RealCollector:
                 "focus_areas": focus_areas,
                 "time_range": task.input.time_range,
             },
-            "user_provided_urls": task.input.source_urls,
+            "user_provided_source_references": task.input.source_urls,
+            "user_material_count": len(task.input.public_materials),
             "planning_rules": [
-                "为每个 competitor 规划 3 到 5 个公开网页 URL。",
-                "优先选择能支持分析维度的高信号页面，例如产品介绍、业务介绍、创作者/商家中心、广告/商业化页面、帮助中心、新闻稿。",
-                "用户提供的 URL 只能分配给与该 URL 域名或页面主题匹配的 competitor。",
-                "不要输出法律声明、隐私政策、用户协议、ICP备案、证照、登录页、纯首页页脚、robots.txt、sitemap.xml。",
-                "reason 说明该 URL 预计能支持哪些分析维度。",
-                "如果不确定具体路径，可以返回该竞品最可能的官方业务或帮助中心域名，但不要编造证据内容。",
+                "只规划资料清单，不访问网页，不抓取网站内容。",
+                "建议资料应来自用户可自行提供的公开信息，例如官网产品介绍、商家/创作者帮助中心、新闻稿、公开报告、应用商店描述、截图文字说明。",
+                "不要把建议来源当作已经采集到的证据。",
+                "suggested_source 可以是来源类型、官方入口或用户应补充的资料名称。",
+                "reason 说明该资料预计能支持哪些分析维度。",
             ],
             "output_schema": {
-                "sources": [
+                "suggestions": [
                     {
                         "competitor": "竞品名，必须来自 competitors",
-                        "url": "https://example.com/path",
-                        "reason": "为什么这个来源适合本次分析",
+                        "material_type": "资料类型",
+                        "suggested_source": "建议补充或核对的公开资料",
+                        "reason": "为什么需要这份资料",
+                        "priority": "high|medium|low",
                     }
                 ]
             },
         }
         return json.dumps(payload, ensure_ascii=False)
 
-    def _parse_source_plan(self, task: TaskDetail, payload: dict[str, Any]) -> list[SourceCandidate]:
-        candidates: list[SourceCandidate] = []
-        seen: set[tuple[str, str]] = set()
-
-        def add(url: str, competitor: str, reason: str) -> None:
-            normalized = self._normalize_url(url)
-            key = (competitor, normalized)
-            if (
-                not normalized
-                or key in seen
-                or self._is_low_value_url(normalized)
-                or self._url_belongs_to_other_competitor(normalized, competitor, task.input.competitors)
-            ):
-                return
-            seen.add(key)
-            candidates.append(SourceCandidate(url=normalized, competitor=competitor, reason=reason[:120]))
-
-        raw_items = payload.get("sources") or payload.get("candidates") or []
+    def _parse_source_suggestions(self, task: TaskDetail, payload: dict[str, Any]) -> list[SourceSuggestion]:
+        suggestions: list[SourceSuggestion] = []
+        per_competitor_count: dict[str, int] = defaultdict(int)
+        raw_items = payload.get("suggestions") or payload.get("sources") or []
         if not isinstance(raw_items, list):
             return []
-        per_competitor_count: dict[str, int] = defaultdict(int)
+
         for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
             competitor = str(raw.get("competitor", "")).strip()
             if competitor not in task.input.competitors or per_competitor_count[competitor] >= 5:
                 continue
-            reason = str(raw.get("reason", "")).strip() or "LLM planned source"
-            before = len(candidates)
-            add(str(raw.get("url", "")), competitor, f"llm_planned: {reason}")
-            if len(candidates) > before:
-                per_competitor_count[competitor] += 1
-        return candidates
+            material_type = str(raw.get("material_type", "")).strip() or "公开资料"
+            suggested_source = str(raw.get("suggested_source", "")).strip() or self._resolve_official_reference(competitor)
+            reason = str(raw.get("reason", "")).strip() or "用于补充竞品分析证据。"
+            priority = str(raw.get("priority", "medium")).strip().lower()
+            if priority not in {"high", "medium", "low"}:
+                priority = "medium"
+            suggestions.append(
+                SourceSuggestion(
+                    competitor=competitor,
+                    material_type=material_type[:40],
+                    suggested_source=suggested_source[:160],
+                    reason=reason[:180],
+                    priority=priority,
+                )
+            )
+            per_competitor_count[competitor] += 1
+        return suggestions
 
-    def _fallback_plan_sources(self, task: TaskDetail) -> list[SourceCandidate]:
-        candidates: list[SourceCandidate] = []
-        seen: set[tuple[str, str]] = set()
-
-        def add(url: str, competitor: str, reason: str) -> None:
-            normalized = self._normalize_url(url)
-            key = (competitor, normalized)
-            if not normalized or key in seen or self._is_low_value_url(normalized):
-                return
-            seen.add(key)
-            candidates.append(SourceCandidate(url=normalized, competitor=competitor, reason=reason))
-
-        for competitor in task.input.competitors:
-            for raw_url in task.input.source_urls:
-                if len(task.input.competitors) == 1 or self._url_matches_competitor(raw_url, competitor):
-                    add(raw_url, competitor, "fallback_user_url")
-
-            official_url = self._resolve_official_url(competitor)
-            if official_url:
-                add(official_url, competitor, "fallback_official_home")
-
-        return candidates
-
-    async def _fetch_documents(
+    def _fallback_public_source_suggestions(
         self,
-        candidates: list[SourceCandidate],
+        task: TaskDetail,
         focus_areas: list[str],
-    ) -> tuple[list[SourceDocument], list[dict[str, Any]]]:
-        events: list[dict[str, Any]] = []
-        documents: list[SourceDocument] = []
-        seen_text_hashes: set[str] = set()
-
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=httpx.Timeout(12.0, connect=6.0),
-            headers=COLLECTION_HEADERS,
-        ) as client:
-            for candidate in candidates:
-                if len([doc for doc in documents if doc.competitor == candidate.competitor]) >= self.max_pages_per_competitor:
-                    continue
-                result = await self._fetch_candidate(client, candidate)
-                events.append(result["event"])
-
-                for sitemap_url in result.get("discovered_urls", [])[:2]:
-                    nested = await self._fetch_candidate(
-                        client,
-                        SourceCandidate(url=sitemap_url, competitor=candidate.competitor, reason="sitemap_page"),
+    ) -> list[SourceSuggestion]:
+        suggestions: list[SourceSuggestion] = []
+        templates = [
+            ("官网/产品介绍", "补充产品定位、核心场景和目标用户。", "high"),
+            ("商家/创作者/帮助中心", "补充用户体验、运营流程和生态服务。", "high"),
+            ("商业化/广告/电商介绍", "补充商业化能力、投放工具和转化链路。", "medium"),
+            ("新闻稿/公开报告", "补充增长策略、阶段变化和外部验证。", "medium"),
+        ]
+        for competitor in task.input.competitors:
+            official = self._resolve_official_reference(competitor)
+            for material_type, reason, priority in templates:
+                suggestions.append(
+                    SourceSuggestion(
+                        competitor=competitor,
+                        material_type=material_type,
+                        suggested_source=official or f"请补充 {competitor} 的{material_type}文本",
+                        reason=f"{reason} 关注维度：{', '.join(focus_areas)}。",
+                        priority=priority,
                     )
-                    events.append(nested["event"])
-                    for nested_doc in nested["documents"]:
-                        nested_hash = hashlib.sha256(nested_doc.text[:4000].encode("utf-8")).hexdigest()
-                        if nested_hash in seen_text_hashes:
-                            continue
-                        seen_text_hashes.add(nested_hash)
-                        documents.append(nested_doc)
+                )
+        return suggestions
 
-                for doc in result["documents"]:
-                    if len([item for item in documents if item.competitor == doc.competitor]) >= self.max_pages_per_competitor:
-                        break
-                    text_hash = hashlib.sha256(doc.text[:4000].encode("utf-8")).hexdigest()
-                    if text_hash in seen_text_hashes:
-                        continue
-                    seen_text_hashes.add(text_hash)
-                    documents.append(doc)
+    @staticmethod
+    def _suggestion_to_context(item: SourceSuggestion) -> dict[str, str]:
+        return {
+            "competitor": item.competitor,
+            "material_type": item.material_type,
+            "suggested_source": item.suggested_source,
+            "reason": item.reason,
+            "priority": item.priority,
+        }
 
-                    sitemap_urls = self._extract_sitemap_urls(doc.text, doc.url, focus_areas)
-                    for sitemap_url in sitemap_urls[:2]:
-                        if len([item for item in documents if item.competitor == doc.competitor]) >= self.max_pages_per_competitor:
-                            break
-                        nested = await self._fetch_candidate(
-                            client,
-                            SourceCandidate(url=sitemap_url, competitor=doc.competitor, reason="sitemap_page"),
-                        )
-                        events.append(nested["event"])
-                        for nested_doc in nested["documents"]:
-                            nested_hash = hashlib.sha256(nested_doc.text[:4000].encode("utf-8")).hexdigest()
-                            if nested_hash in seen_text_hashes:
-                                continue
-                            seen_text_hashes.add(nested_hash)
-                            documents.append(nested_doc)
+    def _build_public_documents(
+        self,
+        task: TaskDetail,
+        focus_areas: list[str],
+    ) -> tuple[list[SourceDocument], list[dict[str, Any]], str]:
+        events: list[dict[str, Any]] = []
+        documents, material_events = self._documents_from_user_materials(task)
+        events.extend(material_events)
 
+        if task.input.source_urls:
+            events.append(
+                {
+                    "message": "已记录用户提供的来源引用，不进行自动访问",
+                    "stage": "source_references_recorded",
+                    "context": {
+                        "source_reference_count": len(task.input.source_urls),
+                        "source_references": task.input.source_urls[:8],
+                        "network_fetch": "disabled",
+                    },
+                }
+            )
+
+        if documents:
+            events.append(
+                {
+                    "message": "已从用户提供的公开资料中生成分析文档",
+                    "stage": "user_public_materials_ingested",
+                    "context": {
+                        "document_count": len(documents),
+                        "focus_areas": focus_areas,
+                    },
+                }
+            )
+            return documents, events, "user_public_materials"
+
+        sample_documents = self._sample_documents(task)
+        if sample_documents:
+            events.append(
+                {
+                    "level": "warning",
+                    "message": "未检测到有效用户公开资料，已使用内置演示资料跑通流程",
+                    "stage": "demo_sample_materials_loaded",
+                    "context": {
+                        "document_count": len(sample_documents),
+                        "note": "正式分析请替换为用户上传或粘贴的真实公开资料。",
+                    },
+                }
+            )
+            return sample_documents, events, "demo_sample_materials"
+
+        events.append(
+            {
+                "level": "warning",
+                "message": "未获得可分析的公开资料",
+                "stage": "public_materials_empty",
+                "context": {
+                    "user_material_count": len(task.input.public_materials),
+                    "known_sample_available": False,
+                },
+            }
+        )
+        return [], events, "empty_public_materials"
+
+    def _documents_from_user_materials(self, task: TaskDetail) -> tuple[list[SourceDocument], list[dict[str, Any]]]:
+        documents: list[SourceDocument] = []
+        events: list[dict[str, Any]] = []
+        seen_hashes: set[str] = set()
+        per_competitor_count: dict[str, int] = defaultdict(int)
+
+        for index, raw_material in enumerate(task.input.public_materials[:12], start=1):
+            text = self._material_to_text(raw_material)
+            if len(text) < 80:
+                events.append(
+                    {
+                        "level": "warning",
+                        "message": "公开资料过短，已跳过",
+                        "stage": "public_material_skipped",
+                        "context": {"index": index, "text_length": len(text)},
+                    }
+                )
+                continue
+
+            competitor = self._infer_competitor(text, task.input.competitors)
+            if not competitor:
+                events.append(
+                    {
+                        "level": "warning",
+                        "message": "公开资料未识别到对应竞品，已跳过",
+                        "stage": "public_material_skipped",
+                        "context": {
+                            "index": index,
+                            "competitors": task.input.competitors,
+                            "text_preview": text[:160],
+                        },
+                    }
+                )
+                continue
+            if per_competitor_count[competitor] >= self.max_pages_per_competitor:
+                continue
+
+            text_hash = hashlib.sha256(text[:4000].encode("utf-8")).hexdigest()
+            if text_hash in seen_hashes:
+                continue
+            seen_hashes.add(text_hash)
+
+            source_ref = self._pick_source_reference(task.input.source_urls, competitor, index)
+            title = self._infer_material_title(raw_material, competitor, index)
+            documents.append(
+                SourceDocument(
+                    doc_id=self._build_doc_id(source_ref, text),
+                    competitor=competitor,
+                    url=source_ref,
+                    title=title,
+                    text=text[:12000],
+                    fetched_at=datetime.utcnow().isoformat(),
+                )
+            )
+            per_competitor_count[competitor] += 1
         return documents, events
 
-    async def _fetch_candidate(
-        self,
-        client: httpx.AsyncClient,
-        candidate: SourceCandidate,
-    ) -> dict[str, Any]:
-        try:
-            response = await client.get(candidate.url)
-            content_type = response.headers.get("content-type", "")
-            text = response.text
-            ok = response.status_code < 400 and len(text.strip()) > 40
-            if not ok:
-                return {
-                    "documents": [],
-                    "discovered_urls": [],
-                    "event": {
-                        "level": "warning",
-                        "message": f"来源获取失败：{candidate.url}",
-                        "context": {
-                            "url": candidate.url,
-                            "status_code": response.status_code,
-                            "reason": candidate.reason,
-                        },
-                    },
-                }
-
-            if "xml" in content_type or candidate.url.endswith(".xml") or candidate.url.endswith("robots.txt"):
-                discovered_urls = self._extract_sitemap_urls(text[:200000], candidate.url, [])
-                return {
-                    "documents": [],
-                    "discovered_urls": discovered_urls,
-                    "event": {
-                        "message": f"来源索引获取成功：{candidate.competitor}",
-                        "context": {
-                            "url": str(response.url),
-                            "reason": candidate.reason,
-                            "discovered_url_count": len(discovered_urls),
-                        },
-                    },
-                }
-            else:
-                title, extracted_text = self._extract_content(text)
-
-            if len(extracted_text) < 80:
-                return {
-                    "documents": [],
-                    "discovered_urls": [],
-                    "event": {
-                        "level": "warning",
-                        "message": f"来源正文过短：{candidate.url}",
-                        "context": {"url": candidate.url, "text_length": len(extracted_text)},
-                    },
-                }
-            if self._is_low_value_document(final_url := str(response.url), title, extracted_text):
-                return {
-                    "documents": [],
-                    "discovered_urls": [],
-                    "event": {
-                        "level": "warning",
-                        "message": f"来源正文低价值，已跳过：{candidate.url}",
-                        "context": {
-                            "url": final_url,
-                            "title": title[:120],
-                            "reason": candidate.reason,
-                        },
-                    },
-                }
-
-            doc = SourceDocument(
-                doc_id=self._build_doc_id(final_url, extracted_text),
-                competitor=candidate.competitor,
-                url=final_url,
-                title=title[:120] or candidate.competitor,
-                text=extracted_text[:12000],
-                fetched_at=datetime.utcnow().isoformat(),
+    def _sample_documents(self, task: TaskDetail) -> list[SourceDocument]:
+        documents: list[SourceDocument] = []
+        for competitor in task.input.competitors:
+            sample_text = self._resolve_sample_text(competitor)
+            if not sample_text:
+                continue
+            source_ref = f"内置公开资料样例：{competitor}"
+            documents.append(
+                SourceDocument(
+                    doc_id=self._build_doc_id(source_ref, sample_text),
+                    competitor=competitor,
+                    url=source_ref,
+                    title=f"{competitor} 公开资料样例",
+                    text=sample_text,
+                    fetched_at=datetime.utcnow().isoformat(),
+                )
             )
-            return {
-                "documents": [doc],
-                "discovered_urls": [],
-                "event": {
-                    "message": f"来源获取成功：{candidate.competitor}",
-                    "context": {
-                        "url": final_url,
-                        "title": doc.title,
-                        "text_length": len(doc.text),
-                        "reason": candidate.reason,
-                    },
-                },
-            }
-        except Exception as exc:
-            return {
-                "documents": [],
-                "discovered_urls": [],
-                "event": {
-                    "level": "warning",
-                    "message": f"来源获取异常：{candidate.url}",
-                    "context": {"url": candidate.url, "error": f"{type(exc).__name__}: {exc}"},
-                },
-            }
+        return documents
 
     async def _extract_evidence(
         self,
@@ -446,15 +475,15 @@ class RealCollector:
             {
                 "doc_id": doc.doc_id,
                 "competitor": doc.competitor,
-                "url": doc.url,
+                "source": doc.url,
                 "title": doc.title,
                 "text": doc.text[:3500],
             }
             for doc in documents[:10]
         ]
         system_prompt = (
-            "你是严谨的信息抽取助手。只能基于用户提供的真实网页正文抽取证据。"
-            "不要补充正文里没有的信息。请严格返回JSON。"
+            "你是严谨的信息抽取助手。只能基于用户提供或系统明确标记的公开资料正文抽取证据。"
+            "不要补充资料正文里没有的信息，不要把来源建议当作证据。请严格返回JSON。"
         )
         user_prompt = json.dumps(
             {
@@ -575,40 +604,78 @@ class RealCollector:
         return evidence
 
     @staticmethod
-    def _extract_content(html: str) -> tuple[str, str]:
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
-            tag.decompose()
-        title = soup.title.get_text(" ", strip=True) if soup.title else ""
-        candidates = []
-        for selector in ["main", "article", "[role=main]", "body"]:
-            node = soup.select_one(selector)
-            if node:
-                candidates.append(node.get_text("\n", strip=True))
-        text = max(candidates, key=len, default=soup.get_text("\n", strip=True))
-        return title, RealCollector._clean_text(text)
+    def _material_to_text(material: str) -> str:
+        raw = str(material or "").strip()
+        if not raw:
+            return ""
+        if "<" in raw and ">" in raw:
+            soup = BeautifulSoup(raw, "html.parser")
+            for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
+                tag.decompose()
+            raw = soup.get_text("\n", strip=True)
+        return RealCollector._clean_text(raw)
 
     @staticmethod
-    def _extract_sitemap_urls(text: str, base_url: str, focus_areas: list[str]) -> list[str]:
-        urls = re.findall(r"<loc>\s*([^<]+)\s*</loc>", text, flags=re.IGNORECASE)
-        if not urls and "Sitemap:" in text:
-            urls = [line.split(":", 1)[1].strip() for line in text.splitlines() if line.lower().startswith("sitemap:")]
-        keywords = ["about", "help", "product", "business", "news", "brand", "ecommerce", "shop", "creator"]
-        keywords.extend(focus_areas)
-        picked = []
-        for raw_url in urls:
-            url = urljoin(base_url, raw_url.strip())
-            lowered = url.lower()
-            if any(str(keyword).lower() in lowered for keyword in keywords):
-                picked.append(url)
-        return picked[:6]
+    def _infer_material_title(material: str, competitor: str, index: int) -> str:
+        raw_lines = [line.strip(" #\t") for line in str(material).splitlines() if line.strip()]
+        for line in raw_lines[:3]:
+            if 4 <= len(line) <= 60:
+                return line[:60]
+        return f"{competitor} 公开资料 #{index}"
+
+    @classmethod
+    def _infer_competitor(cls, text: str, competitors: list[str]) -> str:
+        if len(competitors) == 1:
+            return competitors[0]
+        normalized_text = text.lower()
+        for competitor in competitors:
+            if competitor and competitor in text:
+                return competitor
+            for alias in cls._competitor_aliases(competitor):
+                if alias and alias.lower() in normalized_text:
+                    return competitor
+        return ""
+
+    @staticmethod
+    def _competitor_aliases(competitor: str) -> list[str]:
+        aliases = {
+            "抖音": ["douyin", "抖音电商"],
+            "快手": ["kuaishou", "kwai", "快手电商"],
+            "小红书": ["xiaohongshu", "rednote", "小红书蒲公英"],
+            "淘宝": ["taobao", "tmall", "天猫"],
+            "京东": ["jd", "jingdong"],
+        }
+        matched: list[str] = []
+        for key, values in aliases.items():
+            if key in competitor:
+                matched.extend(values)
+        return matched
+
+    def _pick_source_reference(self, source_urls: list[str], competitor: str, index: int) -> str:
+        for raw_url in source_urls:
+            if self._url_matches_competitor(raw_url, competitor):
+                return self._normalize_url(raw_url) or raw_url.strip()
+        if 0 <= index - 1 < len(source_urls):
+            normalized = self._normalize_url(source_urls[index - 1])
+            if normalized:
+                return normalized
+        return f"用户提供公开资料 #{index}"
+
+    def _resolve_sample_text(self, competitor: str) -> str:
+        for key, sample in SAMPLE_PUBLIC_MATERIALS.items():
+            if key in competitor:
+                return sample
+        return ""
 
     @staticmethod
     def _pick_relevant_sentence(text: str, focus_area: str) -> str:
         sentences = re.split(r"(?<=[。！？.!?])\s*", text)
         for sentence in sentences:
             cleaned = RealCollector._clean_text(sentence)
-            if len(cleaned) >= 30 and (focus_area in cleaned or any(word in cleaned for word in ["产品", "用户", "商业", "增长", "服务"])):
+            if len(cleaned) >= 30 and (
+                focus_area in cleaned
+                or any(word in cleaned for word in ["产品", "用户", "商业", "增长", "服务", "体验"])
+            ):
                 return cleaned
         for sentence in sentences:
             cleaned = RealCollector._clean_text(sentence)
@@ -617,50 +684,18 @@ class RealCollector:
         return ""
 
     @staticmethod
-    def _resolve_official_url(competitor: str) -> str:
+    def _resolve_official_reference(competitor: str) -> str:
         for key, url in OFFICIAL_SOURCE_MAP.items():
             if key in competitor:
                 return url
-        slug = re.sub(r"[^a-zA-Z0-9-]+", "", competitor).strip("-").lower()
-        if slug:
-            return f"https://www.{slug}.com"
-        return ""
+        return f"请补充 {competitor} 的公开资料文本"
 
     @staticmethod
-    def _is_low_value_url(url: str) -> bool:
-        lowered = url.lower()
-        low_value_markers = [
-            "robots.txt",
-            "sitemap.xml",
-            "privacy",
-            "terms",
-            "agreement",
-            "legal",
-            "license",
-            "compliance",
-            "login",
-            "register",
-            "passport",
-            "auth",
-            "icp",
-            "beian",
-            "备案",
-            "隐私",
-            "协议",
-            "法律",
-            "证照",
-        ]
-        return any(marker in lowered for marker in low_value_markers)
-
-    @classmethod
-    def _is_low_value_document(cls, url: str, title: str, text: str) -> bool:
-        lowered_url = url.lower()
-        combined = cls._clean_text(f"{title} {text[:1200]}").lower()
-        if any(marker in lowered_url for marker in ["/404", "not-found", "notfound", "error"]):
-            return True
+    def _is_low_value_document(url: str, title: str, text: str) -> bool:
+        combined = RealCollector._clean_text(f"{url} {title} {text[:1200]}").lower()
         if any(marker in combined for marker in ["404", "页面无法访问", "页面不存在", "not found", "返回首页"]):
             return True
-        return cls._is_low_value_text(combined)
+        return RealCollector._is_low_value_text(combined)
 
     @staticmethod
     def _is_low_value_text(text: str) -> bool:
@@ -704,13 +739,6 @@ class RealCollector:
                 return any(host == domain or host.endswith(f".{domain}") for domain in domains)
         ascii_key = re.sub(r"[^a-z0-9]+", "", competitor_key)
         return bool(ascii_key and ascii_key in host.replace("-", "").replace(".", ""))
-
-    @staticmethod
-    def _url_belongs_to_other_competitor(url: str, competitor: str, competitors: list[str]) -> bool:
-        return any(
-            other != competitor and RealCollector._url_matches_competitor(url, other)
-            for other in competitors
-        )
 
     @staticmethod
     def _normalize_url(url: str) -> str:
