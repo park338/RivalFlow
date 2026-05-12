@@ -9,6 +9,7 @@ from statistics import mean
 from typing import Any
 
 from .ai_client import DeepSeekClient
+from .collector import RealCollector
 from .models import DEFAULT_FOCUS_AREAS, ClaimItem, EvidenceItem, TaskDetail, TaskEvent
 from .storage import TaskStore
 
@@ -35,6 +36,7 @@ class PipelineRunner:
     def __init__(self, store: TaskStore, ai_client: DeepSeekClient) -> None:
         self.store = store
         self.ai_client = ai_client
+        self.real_collector = RealCollector(ai_client)
 
     async def run(self, task_id: str) -> None:
         try:
@@ -152,52 +154,32 @@ class PipelineRunner:
         return plan
 
     async def _collector(self, task_id: str, task: TaskDetail) -> list[EvidenceItem]:
-        focus_areas = task.input.focus_areas or DEFAULT_FOCUS_AREAS
         await self._start_node(
             task_id,
             "collector",
-            "正在采集可追溯证据",
+            "正在从真实页面采集可追溯证据",
             context={"source_urls_count": len(task.input.source_urls), "competitor_count": len(task.input.competitors)},
         )
 
-        evidence: list[EvidenceItem] = []
-        for competitor in task.input.competitors:
-            for focus_area in focus_areas:
-                evidence_id = f"ev-{len(evidence) + 1:03d}"
-                score = self._stable_score(competitor, focus_area, task.input.time_range)
-                confidence = round(0.62 + (score % 30) / 100, 2)
-                source_url = self._pick_source_url(task.input.source_urls, competitor)
-                snippet_seed = DIMENSION_SNIPPETS.get(focus_area, "该维度有持续投入。")
-                evidence.append(
-                    EvidenceItem(
-                        evidence_id=evidence_id,
-                        competitor=competitor,
-                        focus_area=focus_area,
-                        source_name=f"{competitor} 官方公开信息",
-                        source_url=source_url,
-                        snippet=f"{competitor}：{snippet_seed}",
-                        confidence=min(confidence, 0.95),
-                    )
-                )
-                if len(evidence) % 3 == 0:
-                    await self._append_event(
-                        task_id,
-                        "info",
-                        f"Collector 已采集 {len(evidence)} 条证据",
-                        node_key="collector",
-                        stage="collector_progress",
-                        context={"latest_evidence_id": evidence_id, "competitor": competitor, "focus_area": focus_area},
-                    )
-                await asyncio.sleep(0.08)
+        output = await self.real_collector.collect(task)
+        for event in output.events:
+            await self._append_event(
+                task_id,
+                event.get("level", "info"),
+                event.get("message", "Collector 事件"),
+                node_key="collector",
+                stage=event.get("stage", "collector_progress"),
+                context=event.get("context", {}),
+            )
 
-        await self._set_evidence(task_id, evidence)
+        await self._set_evidence(task_id, output.evidence)
         await self._finish_node(
             task_id,
             "collector",
-            f"完成证据采集，共 {len(evidence)} 条",
-            context={"evidence_count": len(evidence)},
+            f"完成真实证据采集，共 {len(output.evidence)} 条",
+            context=output.context,
         )
-        return evidence
+        return output.evidence
 
     async def _structurer(
         self,
