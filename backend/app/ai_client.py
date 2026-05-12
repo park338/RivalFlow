@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 
-DEFAULT_DEEPSEEK_API_KEY = "sk-f18b012ec2974e5fa9f5e054bad59345"
+DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 
 
 @dataclass(slots=True)
@@ -30,7 +30,7 @@ class DeepSeekClient:
         base_url: str = "https://api.deepseek.com",
         timeout_seconds: int = 40,
     ) -> None:
-        resolved_key = api_key or os.getenv("DEEPSEEK_API_KEY") or DEFAULT_DEEPSEEK_API_KEY
+        resolved_key = api_key or os.getenv(DEEPSEEK_API_KEY_ENV) or ""
         self.api_key = resolved_key.strip()
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -45,7 +45,7 @@ class DeepSeekClient:
         temperature: float = 0.2,
     ) -> tuple[dict[str, Any], LLMTrace]:
         if not self.api_key:
-            raise ValueError("Missing DeepSeek API key")
+            raise ValueError(f"Missing {DEEPSEEK_API_KEY_ENV} environment variable")
 
         payload = {
             "model": self.model,
