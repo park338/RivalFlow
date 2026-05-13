@@ -28,10 +28,12 @@ OFFICIAL_SOURCE_MAP = {
 
 SEARCH_PROVIDER_ENV = "RIVALFLOW_SEARCH_PROVIDER"
 WEB_DISCOVERY_ENV = "RIVALFLOW_ENABLE_WEB_DISCOVERY"
-DEFAULT_SEARCH_PROVIDER = "duckduckgo"
+TAVILY_API_KEY_ENV = "TAVILY_API_KEY"
+DEFAULT_SEARCH_PROVIDER = "tavily"
 MAX_SEARCH_QUERIES_PER_COMPETITOR = 3
 MAX_SEARCH_RESULTS_PER_QUERY = 4
 MAX_FETCH_BYTES = 180_000
+MIN_TAVILY_RAW_CONTENT_LENGTH = 80
 
 COLLECTION_HEADERS = {
     "User-Agent": (
@@ -90,11 +92,13 @@ class SourceSuggestion:
 @dataclass(slots=True)
 class SearchResult:
     query: str
+    provider_query: str
     competitor: str
     title: str
     url: str
     snippet: str
     provider: str
+    raw_content: str = ""
 
 
 @dataclass(slots=True)
@@ -156,6 +160,7 @@ class DuckDuckGoSearchProvider(SearchProvider):
             results.append(
                 SearchResult(
                     query=query,
+                    provider_query=query,
                     competitor=competitor,
                     title=title[:160] or normalized,
                     url=normalized,
@@ -166,6 +171,110 @@ class DuckDuckGoSearchProvider(SearchProvider):
             if len(results) >= limit:
                 break
         return results
+
+
+class TavilySearchProvider(SearchProvider):
+    name = "tavily"
+
+    def __init__(self, api_key: str | None = None, timeout_seconds: int = 20) -> None:
+        self.api_key = (api_key or os.getenv(TAVILY_API_KEY_ENV) or "").strip()
+        self.timeout_seconds = timeout_seconds
+
+    async def search(self, query: str, competitor: str, limit: int) -> list[SearchResult]:
+        if not self.api_key:
+            raise ValueError(f"Missing {TAVILY_API_KEY_ENV} environment variable")
+
+        provider_query = self._prepare_query(query, competitor)
+        payload = {
+            "query": provider_query,
+            "topic": "general",
+            "search_depth": "basic",
+            "max_results": limit,
+            "include_answer": False,
+            "include_images": False,
+            "include_raw_content": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_seconds, connect=8.0)) as client:
+            response = await client.post("https://api.tavily.com/search", headers=headers, json=payload)
+            response.raise_for_status()
+
+        data = response.json()
+        results: list[SearchResult] = []
+        seen_urls: set[str] = set()
+        for raw in data.get("results") or []:
+            if not isinstance(raw, dict):
+                continue
+            normalized = RealCollector._normalize_url(str(raw.get("url", "")))
+            if not normalized or normalized in seen_urls:
+                continue
+            seen_urls.add(normalized)
+            title = RealCollector._clean_text(str(raw.get("title", "")))[:160] or normalized
+            snippet = RealCollector._clean_text(str(raw.get("content", "")))[:300]
+            raw_content = RealCollector._clean_text(str(raw.get("raw_content", "") or ""))
+            results.append(
+                SearchResult(
+                    query=query,
+                    provider_query=provider_query,
+                    competitor=competitor,
+                    title=title,
+                    url=normalized,
+                    snippet=snippet,
+                    provider=self.name,
+                    raw_content=raw_content,
+                )
+            )
+            if len(results) >= limit:
+                break
+        return results
+
+    @staticmethod
+    def _prepare_query(query: str, competitor: str) -> str:
+        prepared = f"{query} {competitor}"
+        replacements = {
+            "抖音": "Douyin",
+            "快手": "Kuaishou",
+            "小红书": "Xiaohongshu RedNote",
+            "淘宝": "Taobao",
+            "天猫": "Tmall",
+            "京东": "JD.com",
+            "拼多多": "Pinduoduo",
+            "美团": "Meituan",
+            "饿了么": "Ele.me",
+            "哔哩哔哩": "Bilibili",
+            "B站": "Bilibili",
+            "微信": "WeChat",
+            "微博": "Weibo",
+            "知乎": "Zhihu",
+            "内容电商": "content ecommerce",
+            "电商": "ecommerce",
+            "产品介绍": "product overview",
+            "产品定位": "product positioning",
+            "用户体验": "user experience",
+            "商业化能力": "monetization capability",
+            "商业化": "monetization",
+            "增长策略": "growth strategy",
+            "创作者": "creator",
+            "商家": "merchant",
+            "官方": "official",
+            "公开资料": "public information",
+            "资料": "information",
+        }
+        for source, target in replacements.items():
+            prepared = prepared.replace(source, f" {target} ")
+        prepared = re.sub(r"[\u4e00-\u9fff]+", " ", prepared)
+        prepared = re.sub(r"\s+", " ", prepared).strip()
+        if len(prepared) < 8:
+            fallback_competitor = competitor
+            for source, target in replacements.items():
+                fallback_competitor = fallback_competitor.replace(source, f" {target} ")
+            fallback_competitor = re.sub(r"[\u4e00-\u9fff]+", " ", fallback_competitor)
+            fallback_competitor = re.sub(r"\s+", " ", fallback_competitor).strip()
+            prepared = f"{fallback_competitor or 'China public platform'} official product business"
+        return prepared[:380]
 
 
 class DisabledSearchProvider(SearchProvider):
@@ -478,11 +587,16 @@ class RealCollector:
                 }
             )
 
+        had_user_documents = bool(documents)
         discovered_documents, discovery_events = await self._discover_public_documents(task, focus_areas, suggestions, documents)
         events.extend(discovery_events)
         documents = self._merge_documents([*documents, *discovered_documents])
         if documents:
-            return documents, events, "user_materials_plus_search" if discovered_documents else "user_public_materials"
+            if discovered_documents and had_user_documents:
+                return documents, events, "user_materials_plus_search"
+            if discovered_documents:
+                return documents, events, "search_public_sources"
+            return documents, events, "user_public_materials"
 
         sample_documents = self._sample_documents(task)
         if sample_documents:
@@ -672,11 +786,13 @@ class RealCollector:
                             "query": query,
                             "competitor": competitor,
                             "provider": self.search_provider.name,
+                            "provider_query": raw_results[0].provider_query if raw_results else "",
                             "accepted": [
                                 {
                                     "title": item.title,
                                     "url": item.url,
                                     "snippet": item.snippet,
+                                    "provider_query": item.provider_query,
                                 }
                                 for item in accepted_results[:4]
                             ],
@@ -759,6 +875,48 @@ class RealCollector:
         focus_areas: list[str],
     ) -> dict[str, Any]:
         try:
+            if not self._is_public_http_url(result.url) or self._is_low_value_url(result.url):
+                return {
+                    "document": None,
+                    "event": {
+                        "level": "warning",
+                        "message": "公开页面因来源规则被过滤",
+                        "stage": "page_reader_filtered",
+                        "context": {"url": result.url, "reason": "non_public_or_low_value"},
+                    },
+                }
+
+            raw_content = self._clean_text(result.raw_content)
+            if (
+                len(raw_content) >= MIN_TAVILY_RAW_CONTENT_LENGTH
+                and not self._is_low_value_document(result.url, result.title, raw_content)
+            ):
+                doc = SourceDocument(
+                    doc_id=self._build_doc_id(result.url, raw_content),
+                    competitor=result.competitor,
+                    url=result.url,
+                    title=(result.title or result.competitor)[:120],
+                    text=raw_content[:12000],
+                    fetched_at=datetime.utcnow().isoformat(),
+                )
+                return {
+                    "document": doc,
+                    "event": {
+                        "message": "Tavily 返回正文可用，已生成候选资料",
+                        "stage": "page_reader_success",
+                        "context": {
+                            "url": result.url,
+                            "title": doc.title,
+                            "competitor": doc.competitor,
+                            "query": result.query,
+                            "provider_query": result.provider_query,
+                            "provider": result.provider,
+                            "content_source": "tavily_raw_content",
+                            "text_length": len(doc.text),
+                        },
+                    },
+                }
+
             response = await client.get(result.url)
             final_url = str(response.url)
             content_type = response.headers.get("content-type", "")
@@ -1263,6 +1421,10 @@ class RealCollector:
         provider = os.getenv(SEARCH_PROVIDER_ENV, DEFAULT_SEARCH_PROVIDER).strip().lower()
         if provider in {"", "disabled", "none", "off"}:
             return DisabledSearchProvider()
+        if provider in {"tavily", "tavily_search"}:
+            if not os.getenv(TAVILY_API_KEY_ENV, "").strip():
+                return DisabledSearchProvider()
+            return TavilySearchProvider()
         if provider in {"duckduckgo", "duckduckgo_html", "ddg"}:
             return DuckDuckGoSearchProvider()
         return DisabledSearchProvider()
