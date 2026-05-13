@@ -234,13 +234,17 @@ function renderNodeDetail(task, nodeKey) {
   if (node.context?.duration_ms) summaryParts.push(`耗时：${node.context.duration_ms}ms`);
   nodeDetailSummaryEl.textContent = summaryParts.join(" | ");
 
+  const nodeContextSummary = buildNodeContextSummary(node.key, node.context || {});
   const contextText = getContextText(node.context || {});
-  if (contextText) {
+  if (nodeContextSummary || contextText) {
     nodeDetailContextEl.classList.remove("hidden");
-    nodeDetailContextEl.textContent = contextText;
+    nodeDetailContextEl.innerHTML = `
+      ${nodeContextSummary}
+      ${contextText ? renderRawContextDetails(contextText, "查看完整节点上下文") : ""}
+    `;
   } else {
     nodeDetailContextEl.classList.add("hidden");
-    nodeDetailContextEl.textContent = "";
+    nodeDetailContextEl.innerHTML = "";
   }
 
   const nodeEvents = (task.events || [])
@@ -259,14 +263,17 @@ function renderNodeDetail(task, nodeKey) {
   nodeEvents.forEach((event) => {
     const li = document.createElement("li");
     li.className = "event";
-    const context = getContextText(event.context || {});
+    const eventContext = event.context || {};
+    const readableContext = buildReadableEventContext(event.stage, eventContext);
+    const rawContext = getContextText(eventContext);
     li.innerHTML = `
       <div class="event-head">
         <span>[${formatTime(event.at)}]</span>
-        <span class="event-tags">${escapeHtml(event.stage || "progress")}</span>
+        <span class="event-tags">${escapeHtml(labelEventStage(event.stage))}</span>
       </div>
       <div>${escapeHtml(event.message || "")}</div>
-      ${context ? `<pre class="event-context">${escapeHtml(context)}</pre>` : ""}
+      ${readableContext}
+      ${rawContext ? renderRawContextDetails(rawContext, "原始上下文") : ""}
     `;
     nodeEventsEl.appendChild(li);
   });
@@ -377,6 +384,254 @@ function formatTime(isoTime) {
 function getContextText(context) {
   if (!context || !Object.keys(context).length) return "";
   return formatContextValue(context);
+}
+
+function buildNodeContextSummary(nodeKey, context) {
+  if (!context || !Object.keys(context).length) return "";
+  if (nodeKey === "collector") {
+    const rows = [
+      ["采集模式", labelContextValue(context.intake_mode || context.mode)],
+      ["搜索方式", labelContextValue(context.search_provider)],
+      ["资料数量", context.document_count],
+      ["证据数量", context.evidence_count],
+      ["覆盖状态", context.coverage_complete === true ? "已覆盖全部维度" : context.coverage_complete === false ? "仍有维度缺证据" : ""],
+    ].filter(([, value]) => value !== undefined && value !== "");
+    const coverage = Array.isArray(context.coverage) ? context.coverage : [];
+    return `
+      ${renderKeyValueGrid(rows)}
+      ${coverage.length ? renderCoverageMatrix(coverage) : ""}
+    `;
+  }
+  if (nodeKey === "structurer") {
+    const details = Array.isArray(context.scoring_details) ? context.scoring_details : [];
+    const rows = [
+      ["证据数量", context.evidence_count],
+      ["评分方式", details.length ? summarizeScoringMethods(details) : ""],
+      ["评分格数", details.length || ""],
+    ].filter(([, value]) => value !== undefined && value !== "");
+    return `
+      ${renderKeyValueGrid(rows)}
+      ${details.length ? renderScoringSummary(details) : ""}
+    `;
+  }
+  if (nodeKey === "planner") {
+    const planPreview = Array.isArray(context.plan_preview) ? context.plan_preview : [];
+    return renderKeyValueGrid([
+      ["分析行业", context.industry],
+      ["分析维度", formatList(context.focus_areas)],
+      ["计划预览", formatList(planPreview)],
+    ]);
+  }
+  if (nodeKey === "analyst") {
+    return renderKeyValueGrid([
+      ["模型", context.model],
+      ["证据数量", context.evidence_count],
+      ["结论 ID", formatList(context.claim_ids)],
+    ]);
+  }
+  if (nodeKey === "reviewer") {
+    return renderKeyValueGrid([
+      ["结论数量", context.claim_count],
+      ["审查意见", formatList(context.reviewer_notes)],
+    ]);
+  }
+  if (nodeKey === "reporter") {
+    return renderKeyValueGrid([
+      ["报告长度", context.report_length],
+      ["引用证据", formatList(context.evidence_ids)],
+    ]);
+  }
+  return "";
+}
+
+function buildReadableEventContext(stage, context) {
+  if (!context || !Object.keys(context).length) return "";
+  if (stage === "web_search_queries_planned") {
+    const queries = Array.isArray(context.queries) ? context.queries : [];
+    return renderReadableBlock("本轮搜索计划", [
+      `搜索服务：${labelContextValue(context.search_provider) || "-"}`,
+      `计划查询：${queries.length} 条${queries.length >= 12 ? "（仅展示前 12 条）" : ""}`,
+    ], queries.map((item) => `${item.competitor || "-"} / ${item.focus_area || "-"}：${item.query || "-"}`));
+  }
+  if (stage === "web_search_results_filtered") {
+    const accepted = Array.isArray(context.accepted) ? context.accepted : [];
+    const rejected = Array.isArray(context.rejected) ? context.rejected : [];
+    return renderReadableBlock("搜索结果筛选", [
+      `目标：${context.competitor || "-"} / ${context.focus_area || "-"}`,
+      `采纳：${accepted.length} 条，过滤：${rejected.length} 条`,
+      `实际查询：${context.provider_query || context.query || "-"}`,
+    ], accepted.map((item) => `${item.title || item.url || "-"}${item.url ? `（${item.url}）` : ""}`));
+  }
+  if (stage === "page_reader_success") {
+    return renderReadableBlock("资料读取结果", [
+      `目标：${context.competitor || "-"} / ${context.focus_area || "-"}`,
+      `来源：${context.title || "-"}`,
+      `正文长度：${context.text_length || 0} 字符`,
+      `内容来源：${labelContextValue(context.content_source) || "网页正文"}`,
+    ], [context.url].filter(Boolean));
+  }
+  if (stage === "public_materials_ready") {
+    const preview = Array.isArray(context.document_preview) ? context.document_preview : [];
+    return renderReadableBlock("采集汇总", [
+      `资料数量：${context.document_count || 0}`,
+      `规划方式：${labelContextValue(context.planning_mode) || "-"}`,
+      `采集方式：${labelContextValue(context.intake_mode) || "-"}`,
+    ], preview.map((item) => `${item.competitor || "-"} / ${item.focus_area || "-"}：${item.title || item.source || "-"}`));
+  }
+  if (stage === "evidence_supplement") {
+    const before = Array.isArray(context.missing_before) ? context.missing_before : [];
+    const after = Array.isArray(context.missing_after) ? context.missing_after : [];
+    return renderReadableBlock("证据补充", [
+      `补充前缺口：${before.length} 个`,
+      `补充后缺口：${after.length} 个`,
+      `当前证据：${context.evidence_count || 0} 条`,
+    ], after.map((item) => `仍缺：${item.competitor || "-"} / ${item.focus_area || "-"}`));
+  }
+  if (stage === "llm_request") {
+    return renderKeyValueGrid([
+      ["模型", context.model],
+      ["证据数量", context.evidence_count],
+      ["输入大小", context.payload_size ? `${context.payload_size} 字符` : ""],
+    ]);
+  }
+  if (stage === "llm_response") {
+    return renderKeyValueGrid([
+      ["模型", context.model],
+      ["耗时", context.latency_ms ? `${context.latency_ms}ms` : ""],
+      ["Token", context.total_tokens],
+      ["响应预览", context.content_preview ? trimText(context.content_preview, 260) : ""],
+    ]);
+  }
+  return "";
+}
+
+function renderKeyValueGrid(rows) {
+  const validRows = rows.filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (!validRows.length) return "";
+  return `
+    <div class="context-grid">
+      ${validRows.map(([label, value]) => `
+        <div class="context-card">
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(formatDisplayValue(value))}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderCoverageMatrix(coverage) {
+  return `
+    <div class="coverage-matrix">
+      <div class="readable-title">证据覆盖</div>
+      ${coverage.map((item) => `
+        <div class="coverage-item ${Number(item.evidence_count || 0) > 0 ? "covered" : "missing"}">
+          <span>${escapeHtml(item.competitor || "-")}</span>
+          <strong>${escapeHtml(item.focus_area || "-")}</strong>
+          <em>${Number(item.evidence_count || 0) > 0 ? `${Number(item.evidence_count)} 条证据` : "待补充"}</em>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderScoringSummary(details) {
+  return `
+    <div class="readable-list">
+      <div class="readable-title">评分依据</div>
+      ${details.slice(0, 12).map((item) => `
+        <div class="readable-row">
+          <span>${escapeHtml(item.competitor || "-")} / ${escapeHtml(item.focus_area || "-")}</span>
+          <strong>${Number(item.score ?? 0)} 分</strong>
+          <em>${escapeHtml((item.evidence_ids || []).join(", ") || "无证据")}</em>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderReadableBlock(title, facts, items = []) {
+  const factRows = facts.filter(Boolean).map((fact) => `<span>${escapeHtml(fact)}</span>`).join("");
+  const itemRows = items.filter(Boolean).slice(0, 8).map((item) => `<li>${escapeHtml(trimText(item, 180))}</li>`).join("");
+  return `
+    <div class="readable-block">
+      <div class="readable-title">${escapeHtml(title)}</div>
+      ${factRows ? `<div class="readable-facts">${factRows}</div>` : ""}
+      ${itemRows ? `<ul>${itemRows}</ul>` : ""}
+    </div>
+  `;
+}
+
+function renderRawContextDetails(contextText, title) {
+  return `
+    <details class="raw-context">
+      <summary>${escapeHtml(title)}</summary>
+      <pre>${escapeHtml(contextText)}</pre>
+    </details>
+  `;
+}
+
+function labelEventStage(stage) {
+  const labels = {
+    node_start: "节点开始",
+    node_finish: "节点完成",
+    llm_request: "请求模型",
+    llm_response: "模型响应",
+    public_source_planning_request: "规划资料",
+    public_source_planning_response: "规划完成",
+    public_source_planning_fallback: "规划兜底",
+    web_search_queries_planned: "搜索计划",
+    web_search_results_filtered: "结果筛选",
+    page_reader_success: "资料读取",
+    page_reader_filtered: "资料过滤",
+    page_reader_failed: "读取失败",
+    page_reader_error: "读取异常",
+    public_materials_ready: "采集完成",
+    evidence_supplement: "证据补充",
+    task_started: "任务开始",
+    task_completed: "任务完成",
+  };
+  return labels[stage] || stage || "进度";
+}
+
+function summarizeScoringMethods(details) {
+  const methods = new Set(details.map((item) => item.method).filter(Boolean));
+  if (methods.has("llm_evidence_based") && methods.size === 1) return "LLM 基于证据评分";
+  if (methods.has("transparent_confidence_fallback")) return "部分使用证据兜底评分";
+  if (methods.has("insufficient_evidence_baseline")) return "存在证据不足基线分";
+  return Array.from(methods).join(", ");
+}
+
+function labelContextValue(value) {
+  const labels = {
+    tavily: "Tavily 公开搜索",
+    controlled_search: "受控公开搜索",
+    public_info_intake: "公共信息采集",
+    search_public_sources: "搜索公开来源",
+    user_materials_plus_search: "用户资料 + 搜索补充",
+    user_public_materials: "用户提供资料",
+    llm_public_source_planning: "LLM 规划公开来源",
+    fallback_public_source_planning: "保守资料清单",
+    tavily_raw_content: "Tavily 正文",
+  };
+  return labels[value] || value || "";
+}
+
+function formatList(value) {
+  if (!Array.isArray(value)) return value || "";
+  return value.filter(Boolean).join("、");
+}
+
+function formatDisplayValue(value) {
+  if (Array.isArray(value)) return formatList(value);
+  if (typeof value === "object") return JSON.stringify(value);
+  return value;
+}
+
+function trimText(value, maxLength) {
+  const text = String(value || "").replaceAll("\\n", "\n").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}...`;
 }
 
 function renderFocusAreaTags() {
