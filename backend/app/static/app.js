@@ -23,6 +23,7 @@ let pollingTimer = null;
 let selectedNodeKey = null;
 let latestTask = null;
 let selectedFocusAreas = new Set(["产品定位", "用户体验", "商业化能力", "增长策略"]);
+let selectedScoreKey = "";
 
 renderFocusAreaTags();
 exportPdfBtn.addEventListener("click", exportReportPdf);
@@ -158,8 +159,8 @@ function renderTask(task) {
   renderTimeline(nodes);
   renderNodeDetail(task, selectedNodeKey);
   renderEvidence(task.evidence || []);
-  renderScorecard(task.result?.scorecard || {});
-  renderClaims(task.result?.claims || []);
+  renderScorecard(task.result?.scorecard || {}, task);
+  renderClaims(task.result?.claims || [], task.evidence || []);
   renderReport(task.result?.markdown_report || "");
 }
 
@@ -317,14 +318,17 @@ function renderEvidence(evidence) {
   });
 }
 
-function renderScorecard(scorecard) {
+function renderScorecard(scorecard, task) {
   const competitors = Object.keys(scorecard);
   if (!competitors.length) {
     scorecardWrapEl.classList.add("hidden");
     scorecardEl.innerHTML = "";
+    selectedScoreKey = "";
     return;
   }
   const dimensions = Object.keys(scorecard[competitors[0]] || {});
+  const scoringDetails = getScoringDetails(task);
+  const validScoreKeys = new Set();
   let table = "<table><thead><tr><th>竞品</th>";
   dimensions.forEach((dimension) => {
     table += `<th>${escapeHtml(dimension)}</th>`;
@@ -333,29 +337,191 @@ function renderScorecard(scorecard) {
   competitors.forEach((competitor) => {
     table += `<tr><td>${escapeHtml(competitor)}</td>`;
     dimensions.forEach((dimension) => {
-      table += `<td>${scorecard[competitor][dimension] ?? "-"}</td>`;
+      const detail = getScoreDetail(scoringDetails, competitor, dimension);
+      const score = scorecard[competitor][dimension] ?? "-";
+      const key = buildScoreKey(competitor, dimension);
+      validScoreKeys.add(key);
+      const buttonClass = detail ? "score-button has-detail" : "score-button";
+      table += `
+        <td>
+          <button
+            type="button"
+            class="${buttonClass}"
+            data-competitor="${escapeAttr(competitor)}"
+            data-dimension="${escapeAttr(dimension)}"
+            title="${detail ? "查看评分来源、过程与边界" : "暂无详细评分依据"}"
+          >${escapeHtml(score)}</button>
+        </td>
+      `;
     });
     table += "</tr>";
   });
   table += "</tbody></table>";
-  scorecardEl.innerHTML = table;
+  if (selectedScoreKey && !validScoreKeys.has(selectedScoreKey)) {
+    selectedScoreKey = "";
+  }
+  const selectedDetail = selectedScoreKey
+    ? scoringDetails.find((item) => buildScoreKey(item.competitor, item.focus_area) === selectedScoreKey)
+    : null;
+  scorecardEl.innerHTML = `
+    ${table}
+    <div class="scorecard-help">点击任一分数，可查看该分数的来源、计算过程和使用边界。</div>
+    ${selectedDetail ? renderScoreExplanation(selectedDetail, task?.evidence || []) : ""}
+  `;
+  scorecardEl.querySelectorAll(".score-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectedScoreKey = buildScoreKey(button.dataset.competitor || "", button.dataset.dimension || "");
+      renderScorecard(latestTask?.result?.scorecard || {}, latestTask);
+    });
+  });
   scorecardWrapEl.classList.remove("hidden");
 }
 
-function renderClaims(claims) {
+function getScoringDetails(task) {
+  const structurerNode = (task?.nodes || []).find((node) => node.key === "structurer");
+  return Array.isArray(structurerNode?.context?.scoring_details)
+    ? structurerNode.context.scoring_details
+    : [];
+}
+
+function getScoreDetail(details, competitor, focusArea) {
+  return details.find((item) => item.competitor === competitor && item.focus_area === focusArea);
+}
+
+function buildScoreKey(competitor, focusArea) {
+  return `${competitor}|||${focusArea}`;
+}
+
+function renderScoreExplanation(detail, evidence) {
+  const evidenceMap = new Map((evidence || []).map((item) => [item.evidence_id, item]));
+  const evidenceIds = Array.isArray(detail.evidence_ids) ? detail.evidence_ids : [];
+  const evidenceItems = evidenceIds.map((id) => evidenceMap.get(id)).filter(Boolean);
+  const calibration = detail.score_calibration || {};
+  const processRows = [
+    ["评分方式", labelScoreMethod(detail.method)],
+    ["LLM 原始分", detail.base_score ?? detail.score],
+    ["最终分", detail.score],
+    ["置信度", detail.confidence !== undefined ? Number(detail.confidence).toFixed(2) : ""],
+    ["校准", formatScoreCalibration(calibration)],
+  ];
+  return `
+    <div class="score-explainer">
+      <div class="score-explainer-head">
+        <div>
+          <span>评分解释</span>
+          <strong>${escapeHtml(detail.competitor || "-")} / ${escapeHtml(detail.focus_area || "-")}</strong>
+        </div>
+        <strong>${Number(detail.score ?? 0)} 分</strong>
+      </div>
+      ${renderKeyValueGrid(processRows)}
+      <div class="score-section">
+        <div class="readable-title">判断理由</div>
+        <p>${escapeHtml(detail.reason || "暂无评分理由。")}</p>
+      </div>
+      <div class="score-section">
+        <div class="readable-title">来源证据</div>
+        ${renderScoreEvidenceList(evidenceIds, evidenceItems)}
+      </div>
+      <div class="score-section boundary">
+        <div class="readable-title">使用边界</div>
+        <p>${escapeHtml(buildScoreBoundary(detail, evidenceItems))}</p>
+      </div>
+    </div>
+  `;
+}
+
+function renderScoreEvidenceList(evidenceIds, evidenceItems) {
+  if (!evidenceIds.length) {
+    return "<p>当前没有绑定证据，分数仅表示中性基线，不建议作为强判断。</p>";
+  }
+  const rows = evidenceIds.map((id) => {
+    const item = evidenceItems.find((candidate) => candidate.evidence_id === id);
+    if (!item) {
+      return `<li><strong>${escapeHtml(id)}</strong>：证据详情暂不可见。</li>`;
+    }
+    const source = isHttpUrl(item.source_url)
+      ? `<a href="${escapeAttr(item.source_url)}" target="_blank" rel="noreferrer">${escapeHtml(item.source_name || item.source_url)}</a>`
+      : `${escapeHtml(item.source_name || "-")}<span>${escapeHtml(item.source_url || "")}</span>`;
+    return `
+      <li>
+        <strong>${escapeHtml(id)}</strong>
+        <span>${source}</span>
+        <em>${escapeHtml(trimText(item.snippet || "", 180))}</em>
+      </li>
+    `;
+  }).join("");
+  return `<ul class="score-evidence-list">${rows}</ul>`;
+}
+
+function formatScoreCalibration(calibration) {
+  if (!calibration || !Object.keys(calibration).length) return "无";
+  const adjustment = Number(calibration.adjustment || 0);
+  const spreadAdjustment = Number(calibration.spread_adjustment || 0);
+  const total = adjustment + spreadAdjustment;
+  if (!total) return "未调整";
+  return `${total > 0 ? "+" : ""}${total} 分`;
+}
+
+function buildScoreBoundary(detail, evidenceItems) {
+  if (detail.method === "insufficient_evidence_baseline") {
+    return detail.missing_info || "该维度缺少可验证证据，当前分数不代表真实能力水平。";
+  }
+  if (detail.missing_info) {
+    return detail.missing_info;
+  }
+  if (!evidenceItems.length) {
+    return "评分详情缺少可展示证据，请优先补充公开资料后复评。";
+  }
+  if (evidenceItems.length < 2) {
+    return "当前主要基于 1 条公开证据，适合作为方向性判断；若用于正式决策，建议补充更多来源交叉验证。";
+  }
+  if (Number(detail.confidence || 0) < 0.68) {
+    return "证据能够支撑方向判断，但置信度偏中等，建议结合更多公开材料复核。";
+  }
+  return "当前证据可支撑该方向性评分，但仍受公开资料粒度限制，不应等同于完整市场审计结论。";
+}
+
+function renderClaims(claims, evidence) {
   claimsEl.innerHTML = "";
   if (!claims.length) {
     claimsWrapEl.classList.add("hidden");
     return;
   }
+  const evidenceMap = new Map((evidence || []).map((item) => [item.evidence_id, item]));
   claims.forEach((claim) => {
-    const evidenceText = (claim.evidence_ids || []).join(", ");
     const li = document.createElement("li");
     li.className = "claim-item";
-    li.textContent = `[${claim.claim_id}] ${claim.title}：${claim.detail}（置信度 ${Number(claim.confidence).toFixed(2)}，证据ID: ${evidenceText}）`;
+    li.innerHTML = `
+      <div class="claim-title">[${escapeHtml(claim.claim_id)}] ${escapeHtml(claim.title)}</div>
+      <p>${escapeHtml(claim.detail)}</p>
+      <div class="claim-meta">
+        <span>置信度 ${Number(claim.confidence).toFixed(2)}</span>
+        <span>${escapeHtml(labelClaimBoundary(claim.confidence, claim.evidence_ids || []))}</span>
+      </div>
+      ${renderClaimEvidenceTags(claim.evidence_ids || [], evidenceMap)}
+    `;
     claimsEl.appendChild(li);
   });
   claimsWrapEl.classList.remove("hidden");
+}
+
+function renderClaimEvidenceTags(evidenceIds, evidenceMap) {
+  if (!evidenceIds.length) {
+    return `<div class="claim-evidence empty">暂无绑定证据，当前结论不建议作为强判断。</div>`;
+  }
+  const tags = evidenceIds.map((id) => {
+    const item = evidenceMap.get(id);
+    const title = item ? `${item.competitor} / ${item.focus_area}：${trimText(item.snippet || "", 120)}` : "证据详情暂不可见";
+    return `<span title="${escapeAttr(title)}">${escapeHtml(id)}</span>`;
+  }).join("");
+  return `<div class="claim-evidence">${tags}</div>`;
+}
+
+function labelClaimBoundary(confidence, evidenceIds) {
+  if (!evidenceIds.length) return "边界：缺少可追溯证据";
+  if (Number(confidence || 0) < 0.68) return "边界：方向可参考，建议补充资料复核";
+  if (evidenceIds.length < 2) return "边界：主要由少量证据支撑";
+  return "边界：证据可追溯，仍需结合业务判断";
 }
 
 function setLoading(isLoading) {
@@ -443,6 +609,7 @@ function buildNodeContextSummary(nodeKey, context) {
   }
   if (nodeKey === "reporter") {
     return renderKeyValueGrid([
+      ["报告模式", labelReportMode(context.report_mode)],
       ["报告长度", context.report_length],
       ["引用证据", formatList(context.evidence_ids)],
     ]);
@@ -497,7 +664,10 @@ function buildReadableEventContext(stage, context) {
     return renderKeyValueGrid([
       ["模型", context.model],
       ["证据数量", context.evidence_count],
+      ["结论数量", context.claim_count],
+      ["建议数量", context.recommendation_count],
       ["输入大小", context.payload_size ? `${context.payload_size} 字符` : ""],
+      ["执行策略", context.policy],
     ]);
   }
   if (stage === "llm_response") {
@@ -631,6 +801,23 @@ function summarizeScoringMethods(details) {
   if (methods.has("transparent_confidence_fallback")) return "部分使用证据兜底评分";
   if (methods.has("insufficient_evidence_baseline")) return "存在证据不足基线分";
   return Array.from(methods).join(", ");
+}
+
+function labelScoreMethod(method) {
+  const labels = {
+    llm_evidence_based: "LLM 基于证据评分",
+    transparent_confidence_fallback: "证据兜底评分",
+    insufficient_evidence_baseline: "证据不足基线分",
+  };
+  return labels[method] || method || "未标记";
+}
+
+function labelReportMode(mode) {
+  const labels = {
+    llm_polished: "LLM 润色报告",
+    deterministic_template: "模板兜底报告",
+  };
+  return labels[mode] || mode || "";
 }
 
 function labelContextValue(value) {
