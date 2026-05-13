@@ -602,8 +602,7 @@ class PipelineRunner:
             "正在生成报告与溯源索引",
             context={"claim_count": len(claims), "recommendation_count": len(recommendations)},
         )
-        await asyncio.sleep(0.2)
-        markdown = self._build_markdown_report(
+        draft_markdown = self._build_markdown_report(
             project_name=task.input.project_name,
             industry=task.input.industry,
             time_range=task.input.time_range,
@@ -613,9 +612,81 @@ class PipelineRunner:
             recommendations=recommendations,
             reviewer_notes=reviewer_notes,
         )
+        markdown = draft_markdown
+        report_mode = "deterministic_template"
+
+        try:
+            user_prompt = self._build_reporter_prompt(
+                task=task,
+                plan=plan,
+                scorecard=scorecard,
+                claims=claims,
+                recommendations=recommendations,
+                reviewer_notes=reviewer_notes,
+                draft_markdown=draft_markdown,
+            )
+            await self._append_event(
+                task_id,
+                "info",
+                "Reporter 正在请求 LLM 润色最终报告",
+                node_key="reporter",
+                stage="llm_request",
+                context={
+                    "model": self.ai_client.model,
+                    "claim_count": len(claims),
+                    "recommendation_count": len(recommendations),
+                    "payload_size": len(user_prompt),
+                    "policy": "只润色和组织表达，必须保留评分卡、证据ID和审查备注。",
+                },
+            )
+            payload, trace = await self.ai_client.complete_json(
+                system_prompt=(
+                    "你是严谨的商业分析报告编辑。你只能基于用户给定的数据润色报告，不能添加外部事实。"
+                    "必须保留评分卡、核心结论中的证据ID、行动建议和审查备注。请严格返回 JSON。"
+                ),
+                user_prompt=user_prompt,
+                max_tokens=3200,
+                temperature=0.15,
+            )
+            await self._append_llm_event(task_id, "reporter", "llm_response", trace)
+            polished = self._extract_valid_report_markdown(payload, draft_markdown, scorecard, claims, reviewer_notes)
+            if polished != draft_markdown:
+                markdown = polished
+                report_mode = "llm_polished"
+            else:
+                await self._append_event(
+                    task_id,
+                    "warning",
+                    "Reporter 保留模板报告（LLM润色结果未通过结构校验）",
+                    node_key="reporter",
+                    stage="llm_fallback",
+                    context={"reason": "polished_report_failed_validation"},
+                )
+        except Exception as exc:
+            await self._append_event(
+                task_id,
+                "warning",
+                "Reporter 保留模板报告（LLM润色异常）",
+                node_key="reporter",
+                stage="llm_fallback",
+                context={"error": f"{type(exc).__name__}: {exc}"},
+            )
 
         await self._merge_result(task_id, lambda result: setattr(result, "markdown_report", markdown))
-        await self._finish_node(task_id, "reporter", "报告生成完成", context={"report_length": len(markdown)})
+        await self._merge_result(
+            task_id,
+            lambda result: result.model_info.update({"reporter_model": self.ai_client.model}),
+        )
+        await self._finish_node(
+            task_id,
+            "reporter",
+            "报告生成完成",
+            context={
+                "report_length": len(markdown),
+                "report_mode": report_mode,
+                "evidence_ids": sorted({item for claim in claims for item in claim.evidence_ids})[:12],
+            },
+        )
 
     async def _set_task_status(self, task_id: str, status: str) -> None:
         await self.store.mutate_task(task_id, lambda task: setattr(task, "status", status))
@@ -1128,6 +1199,89 @@ class PipelineRunner:
             "保持周度证据更新，持续追踪竞品策略变化。",
         ]
         return claims, recommendations
+
+    def _build_reporter_prompt(
+        self,
+        *,
+        task: TaskDetail,
+        plan: list[str],
+        scorecard: dict[str, dict[str, int]],
+        claims: list[ClaimItem],
+        recommendations: list[str],
+        reviewer_notes: list[str],
+        draft_markdown: str,
+    ) -> str:
+        payload = {
+            "task": {
+                "project_name": task.input.project_name,
+                "industry": task.input.industry,
+                "competitors": task.input.competitors,
+                "focus_areas": task.input.focus_areas,
+                "time_range": task.input.time_range,
+            },
+            "plan": plan,
+            "scorecard": scorecard,
+            "claims": [
+                {
+                    "claim_id": claim.claim_id,
+                    "title": claim.title,
+                    "detail": claim.detail,
+                    "confidence": claim.confidence,
+                    "evidence_ids": claim.evidence_ids,
+                }
+                for claim in claims
+            ],
+            "recommendations": recommendations,
+            "reviewer_notes": reviewer_notes,
+            "draft_markdown": draft_markdown,
+            "polishing_rules": [
+                "只改进表达、段落衔接和标题清晰度，不添加外部事实。",
+                "必须保留这些一级结构：任务范围、执行计划、竞品评分卡、核心结论、行动建议、审查备注。",
+                "竞品评分卡必须仍是 Markdown 表格，分数不能改。",
+                "每条核心结论必须保留原 claim 的证据ID，不能新增不存在的证据ID。",
+                "审查备注必须完整保留，不能删除 Reviewer 的风险提示。",
+                "输出必须是 Markdown 字符串，不要包裹代码块。",
+            ],
+            "output_schema": {"markdown_report": "润色后的完整Markdown报告"},
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _extract_valid_report_markdown(
+        self,
+        payload: dict[str, Any],
+        draft_markdown: str,
+        scorecard: dict[str, dict[str, int]],
+        claims: list[ClaimItem],
+        reviewer_notes: list[str],
+    ) -> str:
+        markdown = str(payload.get("markdown_report") or payload.get("report") or "").strip()
+        if markdown.startswith("```"):
+            lines = markdown.splitlines()
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            markdown = "\n".join(lines).strip()
+        if not markdown:
+            return draft_markdown
+        if len(markdown) < max(200, int(len(draft_markdown) * 0.6)):
+            return draft_markdown
+        required_sections = ["## 任务范围", "## 执行计划", "## 竞品评分卡", "## 核心结论", "## 行动建议", "## 审查备注"]
+        if any(section not in markdown for section in required_sections):
+            return draft_markdown
+        required_evidence_ids = {item for claim in claims for item in claim.evidence_ids}
+        if any(evidence_id not in markdown for evidence_id in required_evidence_ids):
+            return draft_markdown
+        for competitor, scores in scorecard.items():
+            if competitor not in markdown:
+                return draft_markdown
+            for focus_area, score in scores.items():
+                if focus_area not in markdown or str(score) not in markdown:
+                    return draft_markdown
+        missing_notes = [note for note in reviewer_notes if note and note not in markdown]
+        if missing_notes:
+            return draft_markdown
+        return markdown
 
     @staticmethod
     def _build_markdown_report(
