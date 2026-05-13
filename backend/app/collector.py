@@ -30,7 +30,7 @@ SEARCH_PROVIDER_ENV = "RIVALFLOW_SEARCH_PROVIDER"
 WEB_DISCOVERY_ENV = "RIVALFLOW_ENABLE_WEB_DISCOVERY"
 TAVILY_API_KEY_ENV = "TAVILY_API_KEY"
 DEFAULT_SEARCH_PROVIDER = "tavily"
-MAX_SEARCH_QUERIES_PER_COMPETITOR = 3
+MAX_SEARCH_QUERIES_PER_PAIR = 1
 MAX_SEARCH_RESULTS_PER_QUERY = 4
 MAX_FETCH_BYTES = 180_000
 MIN_TAVILY_RAW_CONTENT_LENGTH = 80
@@ -94,6 +94,7 @@ class SearchResult:
     query: str
     provider_query: str
     competitor: str
+    focus_area: str
     title: str
     url: str
     snippet: str
@@ -105,6 +106,7 @@ class SearchResult:
 class SourceDocument:
     doc_id: str
     competitor: str
+    focus_area: str
     url: str
     title: str
     text: str
@@ -162,6 +164,7 @@ class DuckDuckGoSearchProvider(SearchProvider):
                     query=query,
                     provider_query=query,
                     competitor=competitor,
+                    focus_area="",
                     title=title[:160] or normalized,
                     url=normalized,
                     snippet=snippet[:300],
@@ -220,6 +223,7 @@ class TavilySearchProvider(SearchProvider):
                     query=query,
                     provider_query=provider_query,
                     competitor=competitor,
+                    focus_area="",
                     title=title,
                     url=normalized,
                     snippet=snippet,
@@ -262,6 +266,22 @@ class TavilySearchProvider(SearchProvider):
             "官方": "official",
             "公开资料": "public information",
             "资料": "information",
+            "核心场景": "core use cases",
+            "目标用户": "target users",
+            "功能": "features",
+            "使用流程": "user flow",
+            "帮助中心": "help center",
+            "服务体验": "service experience",
+            "广告": "advertising",
+            "工具": "tools",
+            "生态": "ecosystem",
+            "公开报告": "public report",
+            "新闻稿": "press release",
+            "技术能力": "technical capability",
+            "推荐": "recommendation",
+            "系统": "system",
+            "稳定性": "stability",
+            "算法": "algorithm",
         }
         for source, target in replacements.items():
             prepared = prepared.replace(source, f" {target} ")
@@ -320,6 +340,7 @@ class RealCollector:
                         {
                             "doc_id": item.doc_id,
                             "competitor": item.competitor,
+                            "focus_area": item.focus_area,
                             "title": item.title,
                             "source": item.url,
                             "text_length": len(item.text),
@@ -342,21 +363,34 @@ class RealCollector:
             )
             evidence = self._fallback_evidence(documents, focus_areas)
         else:
-            minimum_expected = min(len(task.input.competitors) * len(focus_areas), 12)
-            if len(evidence) < minimum_expected:
-                fallback_items = self._fallback_evidence(documents, focus_areas)
-                evidence = self._merge_evidence(evidence, fallback_items, minimum_expected)
+            missing_pairs = self._missing_evidence_pairs(task.input.competitors, focus_areas, evidence)
+            if missing_pairs:
+                fallback_items = self._fallback_evidence(documents, focus_areas, missing_pairs)
+                evidence = self._merge_evidence(
+                    evidence,
+                    fallback_items,
+                    max(len(evidence) + len(fallback_items), len(task.input.competitors) * len(focus_areas)),
+                )
+                remaining_pairs = self._missing_evidence_pairs(task.input.competitors, focus_areas, evidence)
                 events.append(
                     {
-                        "message": "公开资料证据数量偏少，已从有效正文补充证据片段",
+                        "message": "公开资料证据覆盖不足，已从有效正文补充缺失维度证据片段",
                         "stage": "evidence_supplement",
                         "context": {
-                            "minimum_expected": minimum_expected,
+                            "missing_before": [
+                                {"competitor": item[0], "focus_area": item[1]}
+                                for item in missing_pairs
+                            ],
+                            "missing_after": [
+                                {"competitor": item[0], "focus_area": item[1]}
+                                for item in remaining_pairs
+                            ],
                             "evidence_count": len(evidence),
                         },
                     }
                 )
 
+        coverage = self._build_evidence_coverage(task.input.competitors, focus_areas, evidence)
         context = {
             "mode": "public_info_intake",
             "planning_mode": planning_mode,
@@ -368,6 +402,8 @@ class RealCollector:
             "suggested_source_count": len(suggestions),
             "document_count": len(documents),
             "evidence_count": len(evidence),
+            "coverage_complete": all(item["evidence_count"] > 0 for item in coverage),
+            "coverage": coverage,
             "source_names": [doc.title for doc in documents[:8]],
         }
         return CollectionOutput(evidence=evidence, context=context, events=events)
@@ -674,6 +710,7 @@ class RealCollector:
                 SourceDocument(
                     doc_id=self._build_doc_id(source_ref, text),
                     competitor=competitor,
+                    focus_area="",
                     url=source_ref,
                     title=title,
                     text=text[:12000],
@@ -726,19 +763,23 @@ class RealCollector:
                     "search_provider": self.search_provider.name,
                     "queries": queries[:12],
                     "limits": {
-                        "max_queries_per_competitor": MAX_SEARCH_QUERIES_PER_COMPETITOR,
+                        "max_queries_per_pair": MAX_SEARCH_QUERIES_PER_PAIR,
                         "max_results_per_query": MAX_SEARCH_RESULTS_PER_QUERY,
-                        "max_pages_per_competitor": self.max_pages_per_competitor,
+                        "max_pages_per_competitor": max(self.max_pages_per_competitor, len(focus_areas)),
                     },
                 },
             }
         )
 
         documents: list[SourceDocument] = []
-        seen_urls = {doc.url for doc in existing_documents}
+        seen_urls = {f"{doc.url}|{doc.focus_area}" for doc in existing_documents}
         per_competitor_docs: dict[str, int] = defaultdict(int)
+        per_pair_docs: dict[tuple[str, str], int] = defaultdict(int)
         for doc in existing_documents:
             per_competitor_docs[doc.competitor] += 1
+            if doc.focus_area:
+                per_pair_docs[(doc.competitor, doc.focus_area)] += 1
+        max_pages_per_competitor = max(self.max_pages_per_competitor, len(focus_areas))
 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(12.0, connect=5.0),
@@ -749,7 +790,10 @@ class RealCollector:
             for query_item in queries:
                 competitor = query_item["competitor"]
                 query = query_item["query"]
-                if per_competitor_docs[competitor] >= self.max_pages_per_competitor:
+                focus_area = query_item.get("focus_area", "")
+                if focus_area and per_pair_docs[(competitor, focus_area)] >= 1:
+                    continue
+                if per_competitor_docs[competitor] >= max_pages_per_competitor:
                     continue
                 try:
                     raw_results = await self.search_provider.search(query, competitor, MAX_SEARCH_RESULTS_PER_QUERY)
@@ -762,6 +806,7 @@ class RealCollector:
                             "context": {
                                 "query": query,
                                 "competitor": competitor,
+                                "focus_area": focus_area,
                                 "provider": self.search_provider.name,
                                 "error": f"{type(exc).__name__}: {exc}",
                             },
@@ -785,6 +830,7 @@ class RealCollector:
                         "context": {
                             "query": query,
                             "competitor": competitor,
+                            "focus_area": focus_area,
                             "provider": self.search_provider.name,
                             "provider_query": raw_results[0].provider_query if raw_results else "",
                             "accepted": [
@@ -802,18 +848,24 @@ class RealCollector:
                 )
 
                 for result in accepted_results:
-                    if per_competitor_docs[competitor] >= self.max_pages_per_competitor:
+                    result.focus_area = focus_area
+                    if focus_area and per_pair_docs[(competitor, focus_area)] >= 1:
                         break
-                    if result.url in seen_urls:
+                    if per_competitor_docs[competitor] >= max_pages_per_competitor:
+                        break
+                    seen_key = f"{result.url}|{focus_area}"
+                    if seen_key in seen_urls:
                         continue
                     fetch_result = await self._read_public_page(client, result, focus_areas)
                     events.append(fetch_result["event"])
                     document = fetch_result.get("document")
                     if not document:
                         continue
-                    seen_urls.add(document.url)
+                    seen_urls.add(seen_key)
                     documents.append(document)
                     per_competitor_docs[competitor] += 1
+                    if document.focus_area:
+                        per_pair_docs[(document.competitor, document.focus_area)] += 1
 
         return documents, events
 
@@ -824,34 +876,54 @@ class RealCollector:
         suggestions: list[SourceSuggestion],
         existing_documents: list[SourceDocument],
     ) -> list[dict[str, str]]:
-        existing_competitors = {doc.competitor for doc in existing_documents}
+        existing_pairs = {
+            (doc.competitor, doc.focus_area)
+            for doc in existing_documents
+            if doc.focus_area
+        }
         suggestions_by_competitor: dict[str, list[SourceSuggestion]] = defaultdict(list)
         for suggestion in suggestions:
             suggestions_by_competitor[suggestion.competitor].append(suggestion)
 
         queries: list[dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for competitor in task.input.competitors:
-            if existing_competitors and len([doc for doc in existing_documents if doc.competitor == competitor]) >= 2:
-                continue
-            base_queries = [
-                f"{competitor} {task.input.industry} 产品介绍 官方",
-                f"{competitor} 商业化 创作者 商家 官方",
-                f"{competitor} {' '.join(focus_areas[:3])} 公开资料",
-            ]
-            for suggestion in suggestions_by_competitor.get(competitor, [])[:2]:
-                base_queries.append(f"{competitor} {suggestion.material_type} {suggestion.suggested_source}")
-
-            for raw_query in base_queries:
-                query = self._clean_text(raw_query)[:120]
-                key = (competitor, query)
-                if not query or key in seen:
+            for focus_area in focus_areas:
+                if (competitor, focus_area) in existing_pairs:
                     continue
-                seen.add(key)
-                queries.append({"competitor": competitor, "query": query})
-                if len([item for item in queries if item["competitor"] == competitor]) >= MAX_SEARCH_QUERIES_PER_COMPETITOR:
-                    break
+                query_count = 0
+                base_queries = [
+                    self._build_dimension_search_query(competitor, task.input.industry, focus_area),
+                ]
+                for suggestion in suggestions_by_competitor.get(competitor, [])[:2]:
+                    base_queries.append(
+                        f"{competitor} {task.input.industry} {focus_area} {suggestion.material_type} "
+                        f"{suggestion.suggested_source}"
+                    )
+
+                for raw_query in base_queries:
+                    query = self._clean_text(raw_query)[:140]
+                    key = (competitor, focus_area, query)
+                    if not query or key in seen:
+                        continue
+                    seen.add(key)
+                    queries.append({"competitor": competitor, "focus_area": focus_area, "query": query})
+                    query_count += 1
+                    if query_count >= MAX_SEARCH_QUERIES_PER_PAIR:
+                        break
         return queries
+
+    @staticmethod
+    def _build_dimension_search_query(competitor: str, industry: str, focus_area: str) -> str:
+        hints = {
+            "产品定位": "产品介绍 核心场景 目标用户 官方 公开资料",
+            "用户体验": "功能 使用流程 帮助中心 服务体验 官方 公开资料",
+            "商业化能力": "商业化 广告 电商 商家 创作者 工具 官方 公开资料",
+            "增长策略": "增长策略 生态 创作者 商家 公开报告 新闻稿 官方",
+            "技术能力": "技术能力 推荐 系统 稳定性 算法 官方 公开资料",
+        }
+        hint = hints.get(focus_area, f"{focus_area} 官方 公开资料")
+        return f"{competitor} {industry} {focus_area} {hint}"
 
     def _is_acceptable_search_result(self, result: SearchResult, competitors: list[str]) -> tuple[bool, str]:
         normalized = self._normalize_url(result.url)
@@ -892,8 +964,9 @@ class RealCollector:
                 and not self._is_low_value_document(result.url, result.title, raw_content)
             ):
                 doc = SourceDocument(
-                    doc_id=self._build_doc_id(result.url, raw_content),
+                    doc_id=self._build_doc_id(f"{result.url}|{result.focus_area}", raw_content),
                     competitor=result.competitor,
+                    focus_area=result.focus_area,
                     url=result.url,
                     title=(result.title or result.competitor)[:120],
                     text=raw_content[:12000],
@@ -908,6 +981,7 @@ class RealCollector:
                             "url": result.url,
                             "title": doc.title,
                             "competitor": doc.competitor,
+                            "focus_area": doc.focus_area,
                             "query": result.query,
                             "provider_query": result.provider_query,
                             "provider": result.provider,
@@ -979,8 +1053,9 @@ class RealCollector:
                 }
 
             doc = SourceDocument(
-                doc_id=self._build_doc_id(final_url, extracted_text),
+                doc_id=self._build_doc_id(f"{final_url}|{result.focus_area}", extracted_text),
                 competitor=result.competitor,
+                focus_area=result.focus_area,
                 url=final_url,
                 title=(title or result.title or result.competitor)[:120],
                 text=extracted_text[:12000],
@@ -995,7 +1070,9 @@ class RealCollector:
                         "url": final_url,
                         "title": doc.title,
                         "competitor": doc.competitor,
+                        "focus_area": doc.focus_area,
                         "query": result.query,
+                        "provider_query": result.provider_query,
                         "provider": result.provider,
                         "text_length": len(doc.text),
                     },
@@ -1027,6 +1104,7 @@ class RealCollector:
                 SourceDocument(
                     doc_id=self._build_doc_id(source_ref, sample_text),
                     competitor=competitor,
+                    focus_area="",
                     url=source_ref,
                     title=f"{competitor} 公开资料样例",
                     text=sample_text,
@@ -1048,15 +1126,22 @@ class RealCollector:
             {
                 "doc_id": doc.doc_id,
                 "competitor": doc.competitor,
+                "target_focus_area": doc.focus_area,
                 "source": doc.url,
                 "title": doc.title,
-                "text": doc.text[:3500],
+                "text": doc.text[:2600],
             }
-            for doc in documents[:10]
+            for doc in documents[:24]
+        ]
+        coverage_targets = [
+            {"competitor": competitor, "focus_area": focus_area}
+            for competitor in task.input.competitors
+            for focus_area in focus_areas
         ]
         system_prompt = (
             "你是严谨的信息抽取助手。只能基于用户提供或系统明确标记的公开资料正文抽取证据。"
-            "不要补充资料正文里没有的信息，不要把来源建议当作证据。请严格返回JSON。"
+            "不要补充资料正文里没有的信息，不要把来源建议当作证据。"
+            "尽量覆盖每个竞品和分析维度，但正文无法支持时必须留空。请严格返回JSON。"
         )
         user_prompt = json.dumps(
             {
@@ -1065,7 +1150,14 @@ class RealCollector:
                     "competitors": task.input.competitors,
                     "focus_areas": focus_areas,
                 },
+                "coverage_targets": coverage_targets,
                 "documents": compact_docs,
+                "extraction_rules": [
+                    "优先使用 target_focus_area 与 focus_area 一致的文档。",
+                    "每条证据必须来自 documents.text 的真实正文，不能改写成正文没有表达的结论。",
+                    "同一个 competitor x focus_area 最多输出 2 条最强证据。",
+                    "如果某个覆盖目标没有可验证正文，不要输出该目标的证据。",
+                ],
                 "output_schema": {
                     "evidence": [
                         {
@@ -1085,7 +1177,7 @@ class RealCollector:
             payload, _trace = await self.ai_client.complete_json(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                max_tokens=1600,
+                max_tokens=3200,
                 temperature=0.1,
             )
         except Exception:
@@ -1146,16 +1238,69 @@ class RealCollector:
                 break
         return merged
 
+    @staticmethod
+    def _missing_evidence_pairs(
+        competitors: list[str],
+        focus_areas: list[str],
+        evidence: list[EvidenceItem],
+    ) -> list[tuple[str, str]]:
+        covered = {(item.competitor, item.focus_area) for item in evidence}
+        return [
+            (competitor, focus_area)
+            for competitor in competitors
+            for focus_area in focus_areas
+            if (competitor, focus_area) not in covered
+        ]
+
+    @staticmethod
+    def _build_evidence_coverage(
+        competitors: list[str],
+        focus_areas: list[str],
+        evidence: list[EvidenceItem],
+    ) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str], list[EvidenceItem]] = defaultdict(list)
+        for item in evidence:
+            grouped[(item.competitor, item.focus_area)].append(item)
+        coverage: list[dict[str, Any]] = []
+        for competitor in competitors:
+            for focus_area in focus_areas:
+                items = grouped.get((competitor, focus_area), [])
+                coverage.append(
+                    {
+                        "competitor": competitor,
+                        "focus_area": focus_area,
+                        "evidence_count": len(items),
+                        "evidence_ids": [item.evidence_id for item in items[:3]],
+                    }
+                )
+        return coverage
+
     def _fallback_evidence(
         self,
         documents: list[SourceDocument],
         focus_areas: list[str],
+        target_pairs: list[tuple[str, str]] | None = None,
     ) -> list[EvidenceItem]:
         evidence: list[EvidenceItem] = []
-        for doc in documents:
-            if self._is_low_value_document(doc.url, doc.title, doc.text):
-                continue
-            for focus_area in focus_areas:
+        pairs = target_pairs or sorted(
+            {
+                (doc.competitor, focus_area)
+                for doc in documents
+                for focus_area in focus_areas
+            }
+        )
+        for competitor, focus_area in pairs:
+            exact_docs = [
+                doc for doc in documents
+                if doc.competitor == competitor and doc.focus_area == focus_area
+            ]
+            candidate_docs = exact_docs or [
+                doc for doc in documents
+                if doc.competitor == competitor
+            ]
+            for doc in candidate_docs:
+                if self._is_low_value_document(doc.url, doc.title, doc.text):
+                    continue
                 snippet = self._pick_relevant_sentence(doc.text, focus_area)
                 if not snippet:
                     continue
@@ -1169,11 +1314,12 @@ class RealCollector:
                         source_name=doc.title,
                         source_url=doc.url,
                         snippet=snippet[:220],
-                        confidence=0.62,
+                        confidence=0.62 if doc.focus_area == focus_area else 0.56,
                     )
                 )
                 if len(evidence) >= 20:
                     return evidence
+                break
         return evidence
 
     @staticmethod
@@ -1256,23 +1402,49 @@ class RealCollector:
 
     @staticmethod
     def _minimum_document_target(task: TaskDetail) -> int:
-        return min(max(len(task.input.competitors), 1), 3)
+        focus_area_count = len(task.input.focus_areas or DEFAULT_FOCUS_AREAS)
+        return min(max(len(task.input.competitors) * focus_area_count, 1), 12)
 
     @staticmethod
     def _pick_relevant_sentence(text: str, focus_area: str) -> str:
         sentences = re.split(r"(?<=[。！？.!?])\s*", text)
+        keywords = RealCollector._focus_area_keywords(focus_area)
         for sentence in sentences:
             cleaned = RealCollector._clean_text(sentence)
-            if len(cleaned) >= 30 and (
-                focus_area in cleaned
-                or any(word in cleaned for word in ["产品", "用户", "商业", "增长", "服务", "体验"])
-            ):
+            lowered = cleaned.lower()
+            if len(cleaned) >= 30 and any(keyword in lowered for keyword in keywords):
                 return cleaned
         for sentence in sentences:
             cleaned = RealCollector._clean_text(sentence)
-            if len(cleaned) >= 40:
+            if len(cleaned) >= 40 and not RealCollector._is_low_value_text(cleaned):
                 return cleaned
         return ""
+
+    @staticmethod
+    def _focus_area_keywords(focus_area: str) -> list[str]:
+        keyword_map = {
+            "产品定位": [
+                "产品", "定位", "场景", "目标用户", "用户群", "平台", "社区",
+                "product", "positioning", "use case", "users", "platform", "community",
+            ],
+            "用户体验": [
+                "用户体验", "功能", "流程", "服务", "使用", "下单", "互动", "售后",
+                "user experience", "feature", "flow", "service", "support", "interaction",
+            ],
+            "商业化能力": [
+                "商业化", "广告", "商家", "创作者", "电商", "交易", "投放", "店铺",
+                "monetization", "advertising", "merchant", "creator", "commerce", "shop",
+            ],
+            "增长策略": [
+                "增长", "生态", "战略", "合作", "留存", "规模", "报告",
+                "growth", "strategy", "ecosystem", "creator", "merchant", "report",
+            ],
+            "技术能力": [
+                "技术", "推荐", "算法", "系统", "稳定", "性能",
+                "technology", "recommendation", "algorithm", "system", "stability",
+            ],
+        }
+        return [item.lower() for item in keyword_map.get(focus_area, [focus_area])]
 
     @staticmethod
     def _resolve_official_reference(competitor: str) -> str:
@@ -1407,9 +1579,9 @@ class RealCollector:
     @staticmethod
     def _merge_documents(documents: list[SourceDocument]) -> list[SourceDocument]:
         merged: list[SourceDocument] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for doc in documents:
-            key = (doc.competitor, doc.url)
+            key = (doc.competitor, doc.url, doc.focus_area)
             if key in seen:
                 continue
             seen.add(key)

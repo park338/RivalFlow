@@ -227,7 +227,7 @@ class PipelineRunner:
                     "没有证据时必须标记 missing_info，不能编造理由。请严格返回 JSON。"
                 ),
                 user_prompt=user_prompt,
-                max_tokens=1800,
+                max_tokens=3200,
                 temperature=0.1,
             )
             await self._append_llm_event(task_id, "structurer", "llm_response", trace)
@@ -641,8 +641,11 @@ class PipelineRunner:
                 "必须为每个 competitor x focus_area 输出一条评分。",
                 "score 必须是 0 到 100 的整数。",
                 "必须引用该 competitor 和 focus_area 下真实存在的 evidence_id。",
-                "证据不足时 score 使用 50，并在 missing_info 中说明缺什么，不能编造事实。",
+                "只有该 competitor x focus_area 没有可引用证据时，score 才使用 50，并在 missing_info 中说明缺什么。",
+                "如果引用了有效证据，不要把 50 当默认分；应按证据强弱给出差异化评分：证据较泛为55到65，证据明确为66到85，证据非常充分才高于85。",
+                "reason 必须解释为什么这些 evidence_id 支撑该分数。",
                 "reason 只能解释已给证据能支持什么，不能引入外部资料。",
+                "reason 控制在 60 个汉字以内，missing_info 控制在 40 个汉字以内。",
             ],
             "output_schema": {
                 "scores": [
