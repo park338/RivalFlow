@@ -430,10 +430,16 @@ function buildNodeContextSummary(nodeKey, context) {
     ]);
   }
   if (nodeKey === "reviewer") {
-    return renderKeyValueGrid([
+    const semanticReview = Array.isArray(context.semantic_review) ? context.semantic_review : [];
+    const notes = Array.isArray(context.notes_preview) ? context.notes_preview : [];
+    return `
+      ${renderKeyValueGrid([
       ["结论数量", context.claim_count],
-      ["审查意见", formatList(context.reviewer_notes)],
-    ]);
+      ["LLM 审查", context.semantic_review_count ? `${context.semantic_review_count} 条` : ""],
+      ["审查意见", formatList(notes)],
+    ])}
+      ${semanticReview.length ? renderReviewerSummary(semanticReview) : ""}
+    `;
   }
   if (nodeKey === "reporter") {
     return renderKeyValueGrid([
@@ -550,6 +556,21 @@ function renderScoringSummary(details) {
   `;
 }
 
+function renderReviewerSummary(details) {
+  return `
+    <div class="readable-list">
+      <div class="readable-title">语义审查</div>
+      ${details.slice(0, 8).map((item) => `
+        <div class="readable-row">
+          <span>${escapeHtml(item.claim_id || "-")} · ${escapeHtml(labelReviewVerdict(item.verdict))}</span>
+          <strong>${Number(item.confidence ?? 0).toFixed(2)}</strong>
+          <em>${escapeHtml(trimText(item.reason || "", 120))}</em>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderReadableBlock(title, facts, items = []) {
   const factRows = facts.filter(Boolean).map((fact) => `<span>${escapeHtml(fact)}</span>`).join("");
   const itemRows = items.filter(Boolean).slice(0, 8).map((item) => `<li>${escapeHtml(trimText(item, 180))}</li>`).join("");
@@ -588,10 +609,20 @@ function labelEventStage(stage) {
     page_reader_error: "读取异常",
     public_materials_ready: "采集完成",
     evidence_supplement: "证据补充",
+    llm_fallback: "模型兜底",
     task_started: "任务开始",
     task_completed: "任务完成",
   };
   return labels[stage] || stage || "进度";
+}
+
+function labelReviewVerdict(verdict) {
+  const labels = {
+    pass: "通过",
+    revise: "已保守改写",
+    reject: "证据不足",
+  };
+  return labels[verdict] || verdict || "未标记";
 }
 
 function summarizeScoringMethods(details) {

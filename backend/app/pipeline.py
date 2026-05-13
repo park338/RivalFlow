@@ -342,8 +342,77 @@ class PipelineRunner:
             "正在审查结论与证据映射",
             context={"claim_count": len(claims)},
         )
-        await asyncio.sleep(0.15)
 
+        reviewer_notes = self._rule_review_claims(task, claims, evidence)
+        semantic_details: list[dict[str, Any]] = []
+        try:
+            user_prompt = self._build_reviewer_prompt(task, claims, evidence)
+            await self._append_event(
+                task_id,
+                "info",
+                "Reviewer 正在请求 LLM 语义校验",
+                node_key="reviewer",
+                stage="llm_request",
+                context={
+                    "model": self.ai_client.model,
+                    "claim_count": len(claims),
+                    "evidence_count": len(evidence),
+                    "payload_size": len(user_prompt),
+                    "review_policy": "温和校验：证据大体支持即通过，表达过强时改写。",
+                },
+            )
+            payload, trace = await self.ai_client.complete_json(
+                system_prompt=(
+                    "你是温和但严谨的竞品分析审查员。只能基于用户提供的证据片段审查结论，不能补充外部事实。"
+                    "证据能大体支持结论时应给 pass；结论表达过强但方向正确时给 revise；"
+                    "只有结论与证据明显冲突或完全无关时才给 reject。请严格返回 JSON。"
+                ),
+                user_prompt=user_prompt,
+                max_tokens=2200,
+                temperature=0.1,
+            )
+            await self._append_llm_event(task_id, "reviewer", "llm_response", trace)
+            reviewer_notes, semantic_details = self._apply_reviewer_payload(
+                claims,
+                evidence,
+                payload,
+                reviewer_notes,
+            )
+        except Exception as exc:
+            reviewer_notes.append(f"LLM 语义审查暂不可用，已保留规则审查结果：{type(exc).__name__}。")
+            await self._append_event(
+                task_id,
+                "warning",
+                "Reviewer 使用规则审查结果（LLM语义校验异常）",
+                node_key="reviewer",
+                stage="llm_fallback",
+                context={"error": f"{type(exc).__name__}: {exc}"},
+            )
+
+        if not reviewer_notes:
+            reviewer_notes.append("结论已通过审查：每条结论均可追溯到证据。")
+
+        await self._merge_result(task_id, lambda result: setattr(result, "claims", list(claims)))
+        await self._merge_result(task_id, lambda result: result.reviewer_notes.extend(reviewer_notes))
+        await self._finish_node(
+            task_id,
+            "reviewer",
+            f"审查完成，反馈 {len(reviewer_notes)} 条",
+            context={
+                "claim_count": len(claims),
+                "semantic_review_count": len(semantic_details),
+                "notes_preview": reviewer_notes[:4],
+                "semantic_review": semantic_details[:8],
+            },
+        )
+        return reviewer_notes, claims
+
+    def _rule_review_claims(
+        self,
+        task: TaskDetail,
+        claims: list[ClaimItem],
+        evidence: list[EvidenceItem],
+    ) -> list[str]:
         reviewer_notes: list[str] = []
         evidence_ids = {item.evidence_id for item in evidence}
         evidence_by_competitor: dict[str, list[str]] = defaultdict(list)
@@ -356,23 +425,165 @@ class PipelineRunner:
                 competitor = self._extract_competitor_hint(task.input.competitors, claim.title + claim.detail)
                 candidate_ids = evidence_by_competitor.get(competitor) or sorted(evidence_ids)
                 cleaned_ids = candidate_ids[:2]
-                reviewer_notes.append(f"{claim.claim_id} 缺少有效证据ID，已自动补齐。")
+                if cleaned_ids:
+                    reviewer_notes.append(f"{claim.claim_id} 缺少有效证据ID，已自动补齐。")
+                else:
+                    reviewer_notes.append(f"{claim.claim_id} 缺少有效证据ID，且当前无可补齐证据。")
             if claim.confidence < 0.65:
                 reviewer_notes.append(f"{claim.claim_id} 置信度偏低，建议补抓更多来源。")
                 claim.confidence = round(min(0.75, claim.confidence + 0.08), 2)
             claim.evidence_ids = cleaned_ids
+        return reviewer_notes
 
-        if not reviewer_notes:
-            reviewer_notes.append("结论已通过审查：每条结论均可追溯到证据。")
+    def _build_reviewer_prompt(
+        self,
+        task: TaskDetail,
+        claims: list[ClaimItem],
+        evidence: list[EvidenceItem],
+    ) -> str:
+        evidence_by_id = {item.evidence_id: item for item in evidence}
+        compact_claims = []
+        for claim in claims:
+            compact_claims.append(
+                {
+                    "claim_id": claim.claim_id,
+                    "title": claim.title,
+                    "detail": claim.detail,
+                    "confidence": claim.confidence,
+                    "evidence_ids": claim.evidence_ids,
+                    "referenced_evidence": [
+                        {
+                            "evidence_id": item.evidence_id,
+                            "competitor": item.competitor,
+                            "focus_area": item.focus_area,
+                            "source_name": item.source_name,
+                            "snippet": item.snippet,
+                            "confidence": item.confidence,
+                        }
+                        for evidence_id in claim.evidence_ids
+                        for item in [evidence_by_id.get(evidence_id)]
+                        if item
+                    ],
+                }
+            )
 
-        await self._merge_result(task_id, lambda result: result.reviewer_notes.extend(reviewer_notes))
-        await self._finish_node(
-            task_id,
-            "reviewer",
-            f"审查完成，反馈 {len(reviewer_notes)} 条",
-            context={"notes_preview": reviewer_notes[:2]},
-        )
-        return reviewer_notes, claims
+        payload = {
+            "task": {
+                "project_name": task.input.project_name,
+                "industry": task.input.industry,
+                "competitors": task.input.competitors,
+                "focus_areas": task.input.focus_areas,
+                "time_range": task.input.time_range,
+            },
+            "claims": compact_claims,
+            "review_rules": [
+                "只审查 claim 是否被 referenced_evidence 大体支持，不要求证据覆盖所有细节。",
+                "证据方向一致但表述偏强时使用 revise，给出更保守的 suggested_detail。",
+                "仅在证据明显无关、相反或完全缺失时使用 reject。",
+                "confidence_adjustment 建议在 -0.15 到 0.03 之间，避免过度惩罚。",
+                "evidence_ids 只能从原 claim 的 referenced_evidence 中选择。",
+            ],
+            "output_schema": {
+                "reviews": [
+                    {
+                        "claim_id": "cl-001",
+                        "verdict": "pass|revise|reject",
+                        "reason": "60字以内说明",
+                        "suggested_detail": "verdict=revise时给出更保守表述，可为空",
+                        "confidence_adjustment": 0.0,
+                        "evidence_ids": ["ev-001"],
+                    }
+                ]
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _apply_reviewer_payload(
+        self,
+        claims: list[ClaimItem],
+        evidence: list[EvidenceItem],
+        payload: dict[str, Any],
+        base_notes: list[str],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        notes = list(base_notes)
+        claim_by_id = {claim.claim_id: claim for claim in claims}
+        valid_evidence_ids = {item.evidence_id for item in evidence}
+        review_items = payload.get("reviews") or payload.get("review_results") or []
+        if not isinstance(review_items, list):
+            review_items = []
+
+        details: list[dict[str, Any]] = []
+        reviewed_claim_ids: set[str] = set()
+        for raw in review_items:
+            if not isinstance(raw, dict):
+                continue
+            claim_id = str(raw.get("claim_id", "")).strip()
+            claim = claim_by_id.get(claim_id)
+            if not claim or claim_id in reviewed_claim_ids:
+                continue
+            verdict = str(raw.get("verdict", "pass")).strip().lower()
+            if verdict not in {"pass", "revise", "reject"}:
+                verdict = "pass"
+
+            suggested_ids = [
+                item for item in raw.get("evidence_ids", [])
+                if isinstance(item, str) and item in valid_evidence_ids and item in claim.evidence_ids
+            ]
+            if suggested_ids:
+                claim.evidence_ids = suggested_ids[:4]
+
+            reason = self._clean_review_text(raw.get("reason"), "证据与结论方向一致。", 90)
+            suggested_detail = self._clean_review_text(raw.get("suggested_detail"), "", 180)
+            adjustment = self._clamp_review_adjustment(raw.get("confidence_adjustment", 0.0))
+
+            if verdict == "pass":
+                claim.confidence = round(min(0.95, claim.confidence + max(0.0, adjustment)), 2)
+                notes.append(f"{claim.claim_id} 通过语义审查：{reason}")
+            elif verdict == "revise":
+                if suggested_detail and len(suggested_detail) >= 10:
+                    claim.detail = suggested_detail
+                claim.confidence = round(max(0.55, min(0.9, claim.confidence + (adjustment or -0.05))), 2)
+                notes.append(f"{claim.claim_id} 已按证据改为更保守表述：{reason}")
+            else:
+                if suggested_detail and len(suggested_detail) >= 10:
+                    claim.detail = suggested_detail
+                elif not claim.evidence_ids:
+                    claim.detail = "该结论缺少可验证证据，当前不建议作为强结论使用。"
+                    if "证据不足" not in claim.title:
+                        claim.title = f"{claim.title}（证据不足）"
+                claim.confidence = round(max(0.5, min(claim.confidence, 0.58)), 2)
+                notes.append(f"{claim.claim_id} 证据支持有限，不建议作为强结论：{reason}")
+
+            details.append(
+                {
+                    "claim_id": claim.claim_id,
+                    "verdict": verdict,
+                    "reason": reason,
+                    "confidence": claim.confidence,
+                    "evidence_ids": claim.evidence_ids,
+                }
+            )
+            reviewed_claim_ids.add(claim_id)
+
+        missing_claims = [claim_id for claim_id in claim_by_id if claim_id not in reviewed_claim_ids]
+        if missing_claims:
+            notes.append(f"LLM 未返回 {', '.join(missing_claims)} 的语义审查结果，已保留规则审查结果。")
+        return notes, details
+
+    @staticmethod
+    def _clean_review_text(value: Any, default: str, max_length: int) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return default
+        return text[:max_length]
+
+    @staticmethod
+    def _clamp_review_adjustment(value: Any) -> float:
+        try:
+            adjustment = float(value)
+        except (TypeError, ValueError):
+            adjustment = 0.0
+        return round(max(-0.15, min(adjustment, 0.03)), 2)
 
     async def _reporter(
         self,
