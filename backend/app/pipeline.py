@@ -162,7 +162,8 @@ class PipelineRunner:
                 "source_urls_count": len(task.input.source_urls),
                 "public_material_count": len(task.input.public_materials),
                 "competitor_count": len(task.input.competitors),
-                "network_fetch": "disabled",
+                "network_fetch": "controlled_search" if self.real_collector.enable_web_discovery else "disabled",
+                "search_provider": self.real_collector.search_provider.name,
             },
         )
 

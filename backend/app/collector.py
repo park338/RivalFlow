@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
+import httpx
 from bs4 import BeautifulSoup
 
 from .ai_client import DeepSeekClient
@@ -21,6 +24,23 @@ OFFICIAL_SOURCE_MAP = {
     "小红书": "https://www.xiaohongshu.com",
     "淘宝": "https://www.taobao.com",
     "京东": "https://www.jd.com",
+}
+
+SEARCH_PROVIDER_ENV = "RIVALFLOW_SEARCH_PROVIDER"
+WEB_DISCOVERY_ENV = "RIVALFLOW_ENABLE_WEB_DISCOVERY"
+DEFAULT_SEARCH_PROVIDER = "duckduckgo"
+MAX_SEARCH_QUERIES_PER_COMPETITOR = 3
+MAX_SEARCH_RESULTS_PER_QUERY = 4
+MAX_FETCH_BYTES = 180_000
+
+COLLECTION_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36 RivalFlow/0.2"
+    ),
+    "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.6",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
 }
 
 
@@ -68,6 +88,16 @@ class SourceSuggestion:
 
 
 @dataclass(slots=True)
+class SearchResult:
+    query: str
+    competitor: str
+    title: str
+    url: str
+    snippet: str
+    provider: str
+
+
+@dataclass(slots=True)
 class SourceDocument:
     doc_id: str
     competitor: str
@@ -84,15 +114,88 @@ class CollectionOutput:
     events: list[dict[str, Any]] = field(default_factory=list)
 
 
+class SearchProvider:
+    name = "base"
+
+    async def search(self, query: str, competitor: str, limit: int) -> list[SearchResult]:
+        raise NotImplementedError
+
+
+class DuckDuckGoSearchProvider(SearchProvider):
+    name = "duckduckgo_html"
+
+    def __init__(self, timeout_seconds: int = 12) -> None:
+        self.timeout_seconds = timeout_seconds
+
+    async def search(self, query: str, competitor: str, limit: int) -> list[SearchResult]:
+        params = {"q": query, "kl": "wt-wt"}
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(self.timeout_seconds, connect=5.0),
+            headers=COLLECTION_HEADERS,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get("https://duckduckgo.com/html/", params=params)
+            response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        results: list[SearchResult] = []
+        seen_urls: set[str] = set()
+        for result in soup.select(".result"):
+            link = result.select_one("a.result__a")
+            if not link:
+                continue
+            title = RealCollector._clean_text(link.get_text(" ", strip=True))
+            raw_href = str(link.get("href") or "")
+            url = RealCollector._unwrap_search_redirect(raw_href)
+            normalized = RealCollector._normalize_url(url)
+            if not normalized or normalized in seen_urls:
+                continue
+            snippet_node = result.select_one(".result__snippet")
+            snippet = RealCollector._clean_text(snippet_node.get_text(" ", strip=True) if snippet_node else "")
+            seen_urls.add(normalized)
+            results.append(
+                SearchResult(
+                    query=query,
+                    competitor=competitor,
+                    title=title[:160] or normalized,
+                    url=normalized,
+                    snippet=snippet[:300],
+                    provider=self.name,
+                )
+            )
+            if len(results) >= limit:
+                break
+        return results
+
+
+class DisabledSearchProvider(SearchProvider):
+    name = "disabled"
+
+    async def search(self, query: str, competitor: str, limit: int) -> list[SearchResult]:
+        return []
+
+
 class RealCollector:
-    def __init__(self, ai_client: DeepSeekClient, max_pages_per_competitor: int = 4) -> None:
+    def __init__(
+        self,
+        ai_client: DeepSeekClient,
+        max_pages_per_competitor: int = 4,
+        search_provider: SearchProvider | None = None,
+        enable_web_discovery: bool | None = None,
+    ) -> None:
         self.ai_client = ai_client
         self.max_pages_per_competitor = max_pages_per_competitor
+        self.enable_web_discovery = (
+            enable_web_discovery
+            if enable_web_discovery is not None
+            else os.getenv(WEB_DISCOVERY_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
+        )
+        self.search_provider = search_provider or self._build_search_provider()
 
     async def collect(self, task: TaskDetail) -> CollectionOutput:
         focus_areas = task.input.focus_areas or DEFAULT_FOCUS_AREAS
         suggestions, planning_events, planning_mode = await self._plan_public_sources(task, focus_areas)
-        documents, intake_events, intake_mode = self._build_public_documents(task, focus_areas)
+        documents, intake_events, intake_mode = await self._build_public_documents(task, focus_areas, suggestions)
         events: list[dict[str, Any]] = [
             *planning_events,
             *intake_events,
@@ -149,7 +252,8 @@ class RealCollector:
             "mode": "public_info_intake",
             "planning_mode": planning_mode,
             "intake_mode": intake_mode,
-            "network_fetch": "disabled",
+            "network_fetch": "controlled_search" if self.enable_web_discovery else "disabled",
+            "search_provider": self.search_provider.name,
             "user_material_count": len(task.input.public_materials),
             "source_reference_count": len(task.input.source_urls),
             "suggested_source_count": len(suggestions),
@@ -174,7 +278,8 @@ class RealCollector:
                     "focus_areas": focus_areas,
                     "user_material_count": len(task.input.public_materials),
                     "source_reference_count": len(task.input.source_urls),
-                    "network_fetch": "disabled",
+                    "network_fetch": "controlled_search" if self.enable_web_discovery else "disabled",
+                    "search_provider": self.search_provider.name,
                 },
             }
         ]
@@ -184,7 +289,7 @@ class RealCollector:
             payload, trace = await self.ai_client.complete_json(
                 system_prompt=(
                     "你是竞品研究的公开资料采集规划助手。"
-                    "你只输出建议用户补充或核对的公开资料清单，不访问网页，不爬取网站，不编造证据。"
+                    "你只输出建议用户补充或核对的公开资料清单和可搜索方向，不编造证据。"
                     "建议应覆盖产品定位、用户体验、商业化能力、增长策略等分析维度。"
                     "必须严格返回 JSON。"
                 ),
@@ -236,8 +341,8 @@ class RealCollector:
             "user_provided_source_references": task.input.source_urls,
             "user_material_count": len(task.input.public_materials),
             "planning_rules": [
-                "只规划资料清单，不访问网页，不抓取网站内容。",
-                "建议资料应来自用户可自行提供的公开信息，例如官网产品介绍、商家/创作者帮助中心、新闻稿、公开报告、应用商店描述、截图文字说明。",
+                "只规划资料清单和公开搜索方向，不把搜索建议当作已经采集到的证据。",
+                "建议资料应来自可公开核验的信息，例如官网产品介绍、商家/创作者帮助中心、新闻稿、公开报告、应用商店描述、截图文字说明。",
                 "不要把建议来源当作已经采集到的证据。",
                 "suggested_source 可以是来源类型、官方入口或用户应补充的资料名称。",
                 "reason 说明该资料预计能支持哪些分析维度。",
@@ -323,10 +428,11 @@ class RealCollector:
             "priority": item.priority,
         }
 
-    def _build_public_documents(
+    async def _build_public_documents(
         self,
         task: TaskDetail,
         focus_areas: list[str],
+        suggestions: list[SourceSuggestion],
     ) -> tuple[list[SourceDocument], list[dict[str, Any]], str]:
         events: list[dict[str, Any]] = []
         documents, material_events = self._documents_from_user_materials(task)
@@ -340,12 +446,12 @@ class RealCollector:
                     "context": {
                         "source_reference_count": len(task.input.source_urls),
                         "source_references": task.input.source_urls[:8],
-                        "network_fetch": "disabled",
+                        "network_fetch": "controlled_search" if self.enable_web_discovery else "disabled",
                     },
                 }
             )
 
-        if documents:
+        if len(documents) >= self._minimum_document_target(task):
             events.append(
                 {
                     "message": "已从用户提供的公开资料中生成分析文档",
@@ -357,6 +463,26 @@ class RealCollector:
                 }
             )
             return documents, events, "user_public_materials"
+
+        if documents:
+            events.append(
+                {
+                    "level": "warning",
+                    "message": "用户提供资料数量不足，Collector 将尝试受控搜索补充公开来源",
+                    "stage": "public_materials_insufficient",
+                    "context": {
+                        "document_count": len(documents),
+                        "minimum_target": self._minimum_document_target(task),
+                        "network_fetch": "controlled_search" if self.enable_web_discovery else "disabled",
+                    },
+                }
+            )
+
+        discovered_documents, discovery_events = await self._discover_public_documents(task, focus_areas, suggestions, documents)
+        events.extend(discovery_events)
+        documents = self._merge_documents([*documents, *discovered_documents])
+        if documents:
+            return documents, events, "user_materials_plus_search" if discovered_documents else "user_public_materials"
 
         sample_documents = self._sample_documents(task)
         if sample_documents:
@@ -442,6 +568,295 @@ class RealCollector:
             )
             per_competitor_count[competitor] += 1
         return documents, events
+
+    async def _discover_public_documents(
+        self,
+        task: TaskDetail,
+        focus_areas: list[str],
+        suggestions: list[SourceSuggestion],
+        existing_documents: list[SourceDocument],
+    ) -> tuple[list[SourceDocument], list[dict[str, Any]]]:
+        events: list[dict[str, Any]] = []
+        if not self.enable_web_discovery:
+            return (
+                [],
+                [
+                    {
+                        "message": "搜索式公开来源发现未启用",
+                        "stage": "web_discovery_skipped",
+                        "context": {
+                            "reason": f"{WEB_DISCOVERY_ENV}=0 或搜索能力被关闭",
+                            "search_provider": self.search_provider.name,
+                        },
+                    }
+                ],
+            )
+        if isinstance(self.search_provider, DisabledSearchProvider):
+            return (
+                [],
+                [
+                    {
+                        "message": "搜索适配器未配置，跳过公开来源发现",
+                        "stage": "web_discovery_skipped",
+                        "context": {"search_provider": self.search_provider.name},
+                    }
+                ],
+            )
+
+        queries = self._build_search_queries(task, focus_areas, suggestions, existing_documents)
+        events.append(
+            {
+                "message": f"Collector 已生成 {len(queries)} 个受控搜索查询",
+                "stage": "web_search_queries_planned",
+                "context": {
+                    "search_provider": self.search_provider.name,
+                    "queries": queries[:12],
+                    "limits": {
+                        "max_queries_per_competitor": MAX_SEARCH_QUERIES_PER_COMPETITOR,
+                        "max_results_per_query": MAX_SEARCH_RESULTS_PER_QUERY,
+                        "max_pages_per_competitor": self.max_pages_per_competitor,
+                    },
+                },
+            }
+        )
+
+        documents: list[SourceDocument] = []
+        seen_urls = {doc.url for doc in existing_documents}
+        per_competitor_docs: dict[str, int] = defaultdict(int)
+        for doc in existing_documents:
+            per_competitor_docs[doc.competitor] += 1
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=5.0),
+            headers=COLLECTION_HEADERS,
+            follow_redirects=True,
+            max_redirects=3,
+        ) as client:
+            for query_item in queries:
+                competitor = query_item["competitor"]
+                query = query_item["query"]
+                if per_competitor_docs[competitor] >= self.max_pages_per_competitor:
+                    continue
+                try:
+                    raw_results = await self.search_provider.search(query, competitor, MAX_SEARCH_RESULTS_PER_QUERY)
+                except Exception as exc:
+                    events.append(
+                        {
+                            "level": "warning",
+                            "message": "公开来源搜索失败",
+                            "stage": "web_search_failed",
+                            "context": {
+                                "query": query,
+                                "competitor": competitor,
+                                "provider": self.search_provider.name,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                        }
+                    )
+                    continue
+
+                accepted_results: list[SearchResult] = []
+                rejected_results: list[dict[str, str]] = []
+                for result in raw_results:
+                    allowed, reason = self._is_acceptable_search_result(result, task.input.competitors)
+                    if allowed:
+                        accepted_results.append(result)
+                    else:
+                        rejected_results.append({"url": result.url, "reason": reason})
+
+                events.append(
+                    {
+                        "message": f"公开来源搜索返回 {len(raw_results)} 条，采纳 {len(accepted_results)} 条候选",
+                        "stage": "web_search_results_filtered",
+                        "context": {
+                            "query": query,
+                            "competitor": competitor,
+                            "provider": self.search_provider.name,
+                            "accepted": [
+                                {
+                                    "title": item.title,
+                                    "url": item.url,
+                                    "snippet": item.snippet,
+                                }
+                                for item in accepted_results[:4]
+                            ],
+                            "rejected": rejected_results[:4],
+                        },
+                    }
+                )
+
+                for result in accepted_results:
+                    if per_competitor_docs[competitor] >= self.max_pages_per_competitor:
+                        break
+                    if result.url in seen_urls:
+                        continue
+                    fetch_result = await self._read_public_page(client, result, focus_areas)
+                    events.append(fetch_result["event"])
+                    document = fetch_result.get("document")
+                    if not document:
+                        continue
+                    seen_urls.add(document.url)
+                    documents.append(document)
+                    per_competitor_docs[competitor] += 1
+
+        return documents, events
+
+    def _build_search_queries(
+        self,
+        task: TaskDetail,
+        focus_areas: list[str],
+        suggestions: list[SourceSuggestion],
+        existing_documents: list[SourceDocument],
+    ) -> list[dict[str, str]]:
+        existing_competitors = {doc.competitor for doc in existing_documents}
+        suggestions_by_competitor: dict[str, list[SourceSuggestion]] = defaultdict(list)
+        for suggestion in suggestions:
+            suggestions_by_competitor[suggestion.competitor].append(suggestion)
+
+        queries: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for competitor in task.input.competitors:
+            if existing_competitors and len([doc for doc in existing_documents if doc.competitor == competitor]) >= 2:
+                continue
+            base_queries = [
+                f"{competitor} {task.input.industry} 产品介绍 官方",
+                f"{competitor} 商业化 创作者 商家 官方",
+                f"{competitor} {' '.join(focus_areas[:3])} 公开资料",
+            ]
+            for suggestion in suggestions_by_competitor.get(competitor, [])[:2]:
+                base_queries.append(f"{competitor} {suggestion.material_type} {suggestion.suggested_source}")
+
+            for raw_query in base_queries:
+                query = self._clean_text(raw_query)[:120]
+                key = (competitor, query)
+                if not query or key in seen:
+                    continue
+                seen.add(key)
+                queries.append({"competitor": competitor, "query": query})
+                if len([item for item in queries if item["competitor"] == competitor]) >= MAX_SEARCH_QUERIES_PER_COMPETITOR:
+                    break
+        return queries
+
+    def _is_acceptable_search_result(self, result: SearchResult, competitors: list[str]) -> tuple[bool, str]:
+        normalized = self._normalize_url(result.url)
+        if not normalized:
+            return False, "invalid_url"
+        if not self._is_public_http_url(normalized):
+            return False, "non_public_url"
+        if self._is_low_value_url(normalized):
+            return False, "low_value_url"
+        if self._url_belongs_to_other_competitor(normalized, result.competitor, competitors):
+            return False, "belongs_to_other_competitor"
+        text = self._clean_text(f"{result.title} {result.snippet}")
+        if text and len(text) < 8:
+            return False, "thin_search_result"
+        return True, "accepted"
+
+    async def _read_public_page(
+        self,
+        client: httpx.AsyncClient,
+        result: SearchResult,
+        focus_areas: list[str],
+    ) -> dict[str, Any]:
+        try:
+            response = await client.get(result.url)
+            final_url = str(response.url)
+            content_type = response.headers.get("content-type", "")
+            if response.status_code >= 400:
+                return {
+                    "document": None,
+                    "event": {
+                        "level": "warning",
+                        "message": "公开页面读取失败",
+                        "stage": "page_reader_failed",
+                        "context": {
+                            "url": result.url,
+                            "status_code": response.status_code,
+                            "query": result.query,
+                        },
+                    },
+                }
+            if not self._is_public_http_url(final_url) or self._is_low_value_url(final_url):
+                return {
+                    "document": None,
+                    "event": {
+                        "level": "warning",
+                        "message": "公开页面因来源规则被过滤",
+                        "stage": "page_reader_filtered",
+                        "context": {"url": final_url, "reason": "non_public_or_low_value"},
+                    },
+                }
+
+            raw = response.content[:MAX_FETCH_BYTES]
+            encoding = response.encoding or "utf-8"
+            text = raw.decode(encoding, errors="ignore")
+            if "html" in content_type or "<html" in text[:1000].lower():
+                title, extracted_text = self._extract_content(text)
+            else:
+                title, extracted_text = result.title, self._clean_text(text)
+
+            if len(extracted_text) < 120:
+                return {
+                    "document": None,
+                    "event": {
+                        "level": "warning",
+                        "message": "公开页面正文过短，已跳过",
+                        "stage": "page_reader_filtered",
+                        "context": {
+                            "url": final_url,
+                            "query": result.query,
+                            "text_length": len(extracted_text),
+                        },
+                    },
+                }
+            if self._is_low_value_document(final_url, title, extracted_text):
+                return {
+                    "document": None,
+                    "event": {
+                        "level": "warning",
+                        "message": "公开页面正文低价值，已跳过",
+                        "stage": "page_reader_filtered",
+                        "context": {"url": final_url, "title": title[:120], "query": result.query},
+                    },
+                }
+
+            doc = SourceDocument(
+                doc_id=self._build_doc_id(final_url, extracted_text),
+                competitor=result.competitor,
+                url=final_url,
+                title=(title or result.title or result.competitor)[:120],
+                text=extracted_text[:12000],
+                fetched_at=datetime.utcnow().isoformat(),
+            )
+            return {
+                "document": doc,
+                "event": {
+                    "message": "公开页面读取成功，已生成候选资料",
+                    "stage": "page_reader_success",
+                    "context": {
+                        "url": final_url,
+                        "title": doc.title,
+                        "competitor": doc.competitor,
+                        "query": result.query,
+                        "provider": result.provider,
+                        "text_length": len(doc.text),
+                    },
+                },
+            }
+        except Exception as exc:
+            return {
+                "document": None,
+                "event": {
+                    "level": "warning",
+                    "message": "公开页面读取异常",
+                    "stage": "page_reader_error",
+                    "context": {
+                        "url": result.url,
+                        "query": result.query,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                },
+            }
 
     def _sample_documents(self, task: TaskDetail) -> list[SourceDocument]:
         documents: list[SourceDocument] = []
@@ -616,6 +1031,20 @@ class RealCollector:
         return RealCollector._clean_text(raw)
 
     @staticmethod
+    def _extract_content(html: str) -> tuple[str, str]:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe"]):
+            tag.decompose()
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        candidates = []
+        for selector in ["main", "article", "[role=main]", "body"]:
+            node = soup.select_one(selector)
+            if node:
+                candidates.append(node.get_text("\n", strip=True))
+        text = max(candidates, key=len, default=soup.get_text("\n", strip=True))
+        return title, RealCollector._clean_text(text)
+
+    @staticmethod
     def _infer_material_title(material: str, competitor: str, index: int) -> str:
         raw_lines = [line.strip(" #\t") for line in str(material).splitlines() if line.strip()]
         for line in raw_lines[:3]:
@@ -668,6 +1097,10 @@ class RealCollector:
         return ""
 
     @staticmethod
+    def _minimum_document_target(task: TaskDetail) -> int:
+        return min(max(len(task.input.competitors), 1), 3)
+
+    @staticmethod
     def _pick_relevant_sentence(text: str, focus_area: str) -> str:
         sentences = re.split(r"(?<=[。！？.!?])\s*", text)
         for sentence in sentences:
@@ -696,6 +1129,32 @@ class RealCollector:
         if any(marker in combined for marker in ["404", "页面无法访问", "页面不存在", "not found", "返回首页"]):
             return True
         return RealCollector._is_low_value_text(combined)
+
+    @staticmethod
+    def _is_low_value_url(url: str) -> bool:
+        lowered = url.lower()
+        low_value_markers = [
+            "robots.txt",
+            "sitemap.xml",
+            "privacy",
+            "terms",
+            "agreement",
+            "legal",
+            "license",
+            "compliance",
+            "login",
+            "register",
+            "passport",
+            "auth",
+            "icp",
+            "beian",
+            "备案",
+            "隐私",
+            "协议",
+            "法律",
+            "证照",
+        ]
+        return any(marker in lowered for marker in low_value_markers)
 
     @staticmethod
     def _is_low_value_text(text: str) -> bool:
@@ -741,6 +1200,30 @@ class RealCollector:
         return bool(ascii_key and ascii_key in host.replace("-", "").replace(".", ""))
 
     @staticmethod
+    def _url_belongs_to_other_competitor(url: str, competitor: str, competitors: list[str]) -> bool:
+        return any(
+            other != competitor and RealCollector._url_matches_competitor(url, other)
+            for other in competitors
+        )
+
+    @staticmethod
+    def _is_public_http_url(url: str) -> bool:
+        normalized = RealCollector._normalize_url(url)
+        if not normalized:
+            return False
+        parsed = urlparse(normalized)
+        host = parsed.hostname or ""
+        if parsed.scheme not in {"http", "https"} or not host:
+            return False
+        if host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return True
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved)
+
+    @staticmethod
     def _normalize_url(url: str) -> str:
         value = url.strip()
         if not value:
@@ -751,6 +1234,38 @@ class RealCollector:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return ""
         return value
+
+    @staticmethod
+    def _unwrap_search_redirect(url: str) -> str:
+        value = str(url or "").strip()
+        parsed = urlparse(value)
+        query = parse_qs(parsed.query)
+        for key in ("uddg", "u", "url"):
+            raw_values = query.get(key)
+            if raw_values:
+                return unquote(raw_values[0])
+        return value
+
+    @staticmethod
+    def _merge_documents(documents: list[SourceDocument]) -> list[SourceDocument]:
+        merged: list[SourceDocument] = []
+        seen: set[tuple[str, str]] = set()
+        for doc in documents:
+            key = (doc.competitor, doc.url)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(doc)
+        return merged
+
+    @staticmethod
+    def _build_search_provider() -> SearchProvider:
+        provider = os.getenv(SEARCH_PROVIDER_ENV, DEFAULT_SEARCH_PROVIDER).strip().lower()
+        if provider in {"", "disabled", "none", "off"}:
+            return DisabledSearchProvider()
+        if provider in {"duckduckgo", "duckduckgo_html", "ddg"}:
+            return DuckDuckGoSearchProvider()
+        return DisabledSearchProvider()
 
     @staticmethod
     def _build_doc_id(url: str, text: str) -> str:
