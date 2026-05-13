@@ -225,6 +225,7 @@ class PipelineRunner:
             payload, trace = await self.ai_client.complete_json(
                 system_prompt=(
                     "你是严谨的竞品评分专家。只能基于用户提供的证据评分，不允许补充外部事实。"
+                    "评分用于早期 Demo 的方向性对比，有少量有效证据时不要过度保守。"
                     "没有证据时必须标记 missing_info，不能编造理由。请严格返回 JSON。"
                 ),
                 user_prompt=user_prompt,
@@ -925,7 +926,9 @@ class PipelineRunner:
                 "score 必须是 0 到 100 的整数。",
                 "必须引用该 competitor 和 focus_area 下真实存在的 evidence_id。",
                 "只有该 competitor x focus_area 没有可引用证据时，score 才使用 50，并在 missing_info 中说明缺什么。",
-                "如果引用了有效证据，不要把 50 当默认分；应按证据强弱给出差异化评分：证据较泛为55到65，证据明确为66到85，证据非常充分才高于85。",
+                "证据少不等于能力弱：只要证据能正向支撑该维度，就不要因为来源数量少而打过低分。",
+                "如果引用了有效证据，不要把 50 当默认分；应按证据强弱给出差异化评分：证据较泛但方向相关为58到72，证据明确为68到86，证据非常充分才高于86。",
+                "低于60只用于证据非常模糊、只间接相关，或证据本身显示该维度存在明显短板的情况。",
                 "评分使用 1 分粒度，避免集中使用 60、65、70、75 等固定档位；分差必须由证据强弱解释。",
                 "不同竞品或维度证据强弱相近时，也应结合证据具体性、来源数量和置信度给出 1 到 3 分的细微区分。",
                 "reason 必须解释为什么这些 evidence_id 支撑该分数。",
@@ -1171,12 +1174,12 @@ class PipelineRunner:
     @staticmethod
     def _score_band_for_evidence(avg_confidence: float, evidence_count: int) -> tuple[int, int]:
         if avg_confidence < 0.55:
-            return 52, 66
+            return 58, 74
         if avg_confidence < 0.68:
-            return 56, 76
+            return 62, 82
         if evidence_count >= 2:
-            return 62, 86
-        return 60, 82
+            return 66, 90
+        return 64, 86
 
     @staticmethod
     def _score_focus_keywords(samples: list[EvidenceItem]) -> int:
